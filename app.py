@@ -12,30 +12,31 @@ APP_TZ = ZoneInfo(os.environ.get("TZ", "America/New_York"))
 HCP_KEY = os.environ.get("HCP_API_KEY")
 HCP_BASE = "https://api.housecallpro.com"
 
-# === Настройка имён техников (замени значения на реальные имена) ===
+# Google Distance Matrix (реальный ETA)
+GMAPS_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")  # добавь в DO App Settings -> Environment Variables
+
+# === Фолбэк-имена техников (если ENV NAME_PRO_* не задан) ===
 NAME_MAP: Dict[str, str] = {
-    "pro_5d48854aad6542a28f9da12d0c1b65f2": "Technician A",
-    "pro_e07e8bc2e5464dfdba36866c66a5f62d": "Technician B",
-    "pro_17e6723ece4e47af95bcb6c1766bbb47": "Technician C",
+    "pro_5d48854aad6542a28f9da12d0c1b65f2": "Alex Yakush",
+    "pro_e07e8bc2e5464dfdba36866c66a5f62d": "Vladimir Kovalev",
+    "pro_17e6723ece4e47af95bcb6c1766bbb47": "Nick Litvinov",
 }
 
-# === Домашние адреса/города техников (для первого/последнего слота) ===
+# === Фолбэк-дома техников (если ENV HOME_PRO_* не задан) ===
 HOME_MAP: Dict[str, str] = {
-    # "pro_5d4...": "St. Augustine, FL",
-    # "pro_e07...": "Jacksonville, FL",
-    # "pro_17e...": "Orange Park, FL",
+    # при желании можно прописать дефолты, но ENV приоритетнее
+    # "pro_...": "City, ST"
 }
 
-# Бизнес-правила
-VISIT_MINUTES_DEFAULT = 120    # длительность визита: 2 часа
-BUFFER_MINUTES_DEFAULT = 0     # отображаемый буфер до/после (логика v3 без доп. буферов в вычислениях)
-DEFAULT_WORK_START = time(9, 0)   # 09:00 (по твоему требованию)
-DEFAULT_WORK_END   = time(18, 0)  # 18:00
-VERY_CLOSE_THRESH  = 15           # ETA ≤ 15 мин
-NORMAL_THRESH      = 30           # 15 < ETA ≤ 30 мин (иначе >30 = далеко)
+# Бизнес-правила (политика v3)
+VISIT_MINUTES_DEFAULT = 120    # информативно; окна прибытия = 3ч
+DEFAULT_WORK_START = time(9, 0)
+DEFAULT_WORK_END   = time(18, 0)
+VERY_CLOSE_THRESH  = 15        # ETA ≤ 15 → смещённое окно разрешено (10–1 и т.п.)
+NORMAL_THRESH      = 30        # 15–30 → обычная ступенька 11–2; >30 — тоже можно 11–2 (просто "high" риск)
 
-# Допустимые окна (всегда 3 часа длиной)
-GRID_STARTS = [9, 10, 11, 12, 13, 14, 15]  # 9–12, 10–1, 11–2, 12–3, 1–4, 2–5, 3–6
+# Допустимые 3-часовые окна по целому часу
+GRID_STARTS = [9, 10, 11, 12, 13, 14, 15]  # 9–12,10–1,11–2,12–3,1–4,2–5,3–6
 
 # ====== APP ======
 app = FastAPI(title="LocalPRO Scheduler Bridge")
@@ -45,12 +46,17 @@ class SuggestIn(BaseModel):
     address: str
     days_ahead: int = 3
     preferred_days: Optional[List[str]] = None  # ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
-    window_start: Optional[str] = None          # "12:00"  (например: "только после 12")
-    window_end: Optional[str] = None            # "18:00"
+    window_start: Optional[str] = None          # например "12:00" (только после 12)
+    window_end: Optional[str] = None            # например "18:00"
     job_type: Optional[str] = None
-    visit_minutes: Optional[int] = None         # длительность визита (3ч окно прибытия фикс)
-    buffer_minutes: Optional[int] = None        # только визуальный атрибут в ответе
-    # ВНИМАНИЕ: ETA в этой версии — эвристика (по городам). Реальный ETA добавим отдельно.
+    visit_minutes: Optional[int] = None         # информативно
+    buffer_minutes: Optional[int] = None        # не используется в логике v3 (оставлено для совместимости)
+
+class SuggestOut(BaseModel):
+    address: str
+    timezone: str
+    visit_minutes: int
+    suggestions: List[dict]
 
 # ====== HCP HELPERS ======
 def hcp_get(path: str, params=None):
@@ -73,14 +79,11 @@ def hcp_get(path: str, params=None):
 
 # ====== UTIL ======
 def safe_city(addr_str: str) -> str:
-    # очень простая вырезка города из "Street, City, ST, Zip, Country"
     try:
         parts = [p.strip() for p in addr_str.split(",")]
-        # ищем сегмент перед штатом (2-букв. код), грубо:
         for i in range(len(parts)-1):
             if len(parts[i+1]) == 2 and parts[i+1].isalpha():
                 return parts[i]
-        # запасной вариант — второй сегмент
         if len(parts) >= 2:
             return parts[-3] if len(parts) >= 3 else parts[1]
         return addr_str
@@ -134,12 +137,6 @@ def _walk(obj: Any, path=""):
         yield (path, obj)
 
 def pick_time_and_tech(job: dict) -> Tuple[Optional[datetime], Optional[datetime], Optional[str], str]:
-    """
-    Возвращает:
-      start_utc, end_utc — ОКНА ПРИБЫТИЯ (scheduled_start/end) в UTC,
-      employee_id,
-      address_str
-    """
     start_utc = end_utc = None
     employee_id = None
 
@@ -159,7 +156,6 @@ def pick_time_and_tech(job: dict) -> Tuple[Optional[datetime], Optional[datetime
 
     addr_str = address_to_str(job.get("address") or job.get("service_address") or {})
 
-    # запасной поиск по вложениям
     if not start_utc or not end_utc:
         for p, v in _walk(job):
             low = p.lower()
@@ -176,23 +172,70 @@ def pick_time_and_tech(job: dict) -> Tuple[Optional[datetime], Optional[datetime
 
     return start_utc, end_utc, employee_id, addr_str
 
-# ——— ETA (эвристика до подключения реальных карт) ———
-CITY_EQ_MIN   = 12  # если города совпадают
-CITY_NEAR_MIN = 22  # если разные, но оба в нашем регионе (очень грубо)
-CITY_FAR_MIN  = 35  # далеко
+# ====== RESOLVERS: name & home из ENV с фолбэком ======
+def resolve_name(emp_id: str) -> str:
+    env_key = f"NAME_PRO_{emp_id}"
+    if env_key in os.environ and os.environ[env_key].strip():
+        return os.environ[env_key].strip()
+    return NAME_MAP.get(emp_id, "Technician")
 
-def estimate_eta_minutes(src_addr: str, dst_addr: str) -> int:
-    city_a = safe_city(src_addr).lower()
-    city_b = safe_city(dst_addr).lower()
-    if not city_a or not city_b:
+def resolve_home(emp_id: str) -> Optional[str]:
+    env_key = f"HOME_PRO_{emp_id}"
+    if env_key in os.environ and os.environ[env_key].strip():
+        return os.environ[env_key].strip()
+    return HOME_MAP.get(emp_id)
+
+# ====== ETA ======
+# эвристика (если нет ключа Google)
+CITY_EQ_MIN   = 12
+CITY_NEAR_MIN = 22
+CITY_FAR_MIN  = 35
+NEAR_CITIES = {"st. augustine", "st augustine", "jacksonville", "orange park"}
+
+def estimate_eta_heuristic(src_addr: str, dst_addr: str) -> int:
+    a = safe_city(src_addr).lower()
+    b = safe_city(dst_addr).lower()
+    if not a or not b:
         return CITY_NEAR_MIN
-    if city_a == city_b:
+    if a == b:
         return CITY_EQ_MIN
-    # примитивно: внутри North-East FL — "near", иначе "far"
-    near_cities = {"st. augustine", "jacksonville", "orange park", "st augustine"}
-    if city_a in near_cities and city_b in near_cities:
+    if a in NEAR_CITIES and b in NEAR_CITIES:
         return CITY_NEAR_MIN
     return CITY_FAR_MIN
+
+def google_eta_minutes(src_addr: str, dst_addr: str) -> Optional[int]:
+    if not GMAPS_KEY:
+        return None
+    try:
+        resp = requests.get(
+            "https://maps.googleapis.com/maps/api/distancematrix/json",
+            params={
+                "origins": src_addr,
+                "destinations": dst_addr,
+                "key": GMAPS_KEY,
+                "units": "imperial"
+            },
+            timeout=15
+        )
+        data = resp.json()
+        if data.get("status") != "OK":
+            return None
+        rows = data.get("rows", [])
+        if not rows or not rows[0].get("elements"):
+            return None
+        el = rows[0]["elements"][0]
+        if el.get("status") != "OK":
+            return None
+        seconds = el["duration"]["value"]
+        return int(round(seconds / 60))
+    except Exception:
+        return None
+
+def eta_minutes(src_addr: str, dst_addr: str) -> int:
+    if src_addr is None or dst_addr is None:
+        return CITY_NEAR_MIN
+    real = google_eta_minutes(src_addr, dst_addr)
+    return real if real is not None else estimate_eta_heuristic(src_addr, dst_addr)
 
 def risk_label(eta: int) -> str:
     if eta <= VERY_CLOSE_THRESH:
@@ -204,7 +247,7 @@ def risk_label(eta: int) -> str:
 # ====== DEBUG ======
 @app.get("/health")
 def health():
-    return {"status": "ok", "tz": str(APP_TZ)}
+    return {"status": "ok", "tz": str(APP_TZ), "gmaps": bool(GMAPS_KEY)}
 
 @app.get("/debug/hcp-jobs-compact")
 def debug_hcp_jobs_compact():
@@ -218,9 +261,27 @@ def debug_hcp_jobs_compact():
             "address": addr_str,
             "arrival_window_start_local": to_local(s_utc).isoformat() if s_utc else None,
             "arrival_window_end_local":   to_local(e_utc).isoformat() if e_utc else None,
-            "employee_id": emp_id
+            "employee_id": emp_id,
+            "tech_name": resolve_name(emp_id) if emp_id else None
         })
     return {"count_preview": len(out), "jobs": out}
+
+@app.get("/debug/homes")
+def debug_homes():
+    out = {}
+    keys = set(list(HOME_MAP.keys()))
+    try:
+        data = hcp_get("/jobs")
+        raw = data if isinstance(data, list) else data.get("results") or data.get("jobs") or []
+        for item in (raw if isinstance(raw, list) else []):
+            _, _, emp_id, _ = pick_time_and_tech(item)
+            if emp_id:
+                keys.add(emp_id)
+    except Exception:
+        pass
+    for k in keys:
+        out[k] = resolve_home(k)
+    return {"homes": out, "gmaps": bool(GMAPS_KEY)}
 
 # ====== COLLECT ARRIVAL WINDOWS ======
 def collect_arrival_windows(days_ahead: int) -> Dict[str, List[Tuple[datetime, datetime, str]]]:
@@ -253,21 +314,13 @@ def grid_slot(dt_day: datetime, start_hour: int) -> Tuple[datetime, datetime]:
     e = s + timedelta(hours=3)
     return s, e
 
-def slot_label(s: datetime, e: datetime) -> str:
-    def fmt(dt: datetime) -> str:
-        hh = dt.hour
-        suf = "am" if hh < 12 else "pm"
-        base = hh if 1 <= hh <= 12 else (hh-12 if hh>12 else 12)
-        return f"{base}:00{suf}"
-    return f"{fmt(s)}–{fmt(e)}"
-
 def within_client_window(s: datetime, e: datetime, day_start: datetime, day_end: datetime,
                          win_start_str: Optional[str], win_end_str: Optional[str]) -> bool:
     cl_s = from_local(day_start, win_start_str) or day_start
     cl_e = from_local(day_start, win_end_str) or day_end
     return (s >= cl_s) and (e <= cl_e)
 
-# ====== BUILD CANDIDATES BY POLICY V3 ======
+# ====== BUILD CANDIDATES (POLICY v3 + real ETA) ======
 def build_candidates_for_day(
     emp_id: str,
     dt_day: datetime,
@@ -275,59 +328,35 @@ def build_candidates_for_day(
     new_addr: str,
     win_start_str: Optional[str],
     win_end_str: Optional[str],
-    first_slot_home: Optional[str],
-    last_slot_home: Optional[str]
+    home_addr: Optional[str]
 ) -> List[dict]:
-    """
-    Возвращает кандидатов по сетке согласно политике v3 + клиентским ограничениям.
-    """
     day_start = datetime.combine(dt_day.date(), DEFAULT_WORK_START, tzinfo=APP_TZ)
     day_end   = datetime.combine(dt_day.date(), DEFAULT_WORK_END, tzinfo=APP_TZ)
 
-    # Занятые сеточные старт-часы у техника в этот день:
-    occupied_hours = set()
-    for ws, we, _addr in todays_windows:
-        occupied_hours.add(ws.hour)
-
+    occupied_hours = set(ws.hour for ws, _, _ in todays_windows)
     results: List[dict] = []
 
-    # Помощники для ETA от/к дому
-    def eta_from_home(start_hour: int) -> int:
-        if not first_slot_home:
-            return NORMAL_THRESH  # без данных считаем "нормально"
-        s, e = grid_slot(dt_day, start_hour)
-        return estimate_eta_minutes(first_slot_home, new_addr)
-
-    def eta_to_home(start_hour: int) -> int:
-        if not last_slot_home:
-            return NORMAL_THRESH
-        s, e = grid_slot(dt_day, start_hour)
-        return estimate_eta_minutes(new_addr, last_slot_home)
-
-    # Если нет визитов в этот день: первый слот — базовая сетка с учётом клиента и дома
+    # Если нет визитов в этот день — опираемся на дом техника
     if not todays_windows:
         for h in GRID_STARTS:
-            if h in occupied_hours:
+            if h in occupied_hours:  # на всякий случай
                 continue
             s, e = grid_slot(dt_day, h)
             if not within_client_window(s, e, day_start, day_end, win_start_str, win_end_str):
                 continue
-            # ранжируем по ETA от дома и к дому (последний слот пока неизвестен, учитываем только от дома)
-            eta_h = eta_from_home(h)
+            eta_from_home = eta_minutes(home_addr, new_addr) if home_addr else NORMAL_THRESH
             results.append({
                 "employee_id": emp_id,
-                "tech_name": NAME_MAP.get(emp_id, "Technician"),
+                "tech_name": resolve_name(emp_id),
                 "slot_start": s.isoformat(),
                 "slot_end": e.isoformat(),
-                "ETA_prev": eta_h,
+                "ETA_prev": eta_from_home,
                 "ETA_next": None,
-                "risk": risk_label(eta_h),
+                "risk": risk_label(eta_from_home),
                 "note": "first of day (home proximity)"
             })
         return results
 
-    # Иначе — вставки между окнами + после последнего
-    # Рассматриваем каждую пару (A=prev, B=next) + «хвост» после последнего
     anchors = [(None, None, None)] + todays_windows + [(None, None, None)]
     for i in range(len(anchors)-1):
         A = anchors[i]
@@ -335,22 +364,18 @@ def build_candidates_for_day(
         prev = A if A[0] is not None else None
         nxt  = C if C[0] is not None else None
 
-        # базовый час после A
+        # базовая «соседняя ступенька» после prev (9->11, 11->13, ...)
         base_after_prev = 9
         if prev:
-            base_after_prev = prev[0].hour + 2  # соседняя ступенька (9->11, 11->13, …)
-        # возможен "смещённый" час при очень близкой дороге
-        shifted_after_prev = base_after_prev - 1  # 9->10, 11->12, …
+            base_after_prev = prev[0].hour + 2
+        shifted_after_prev = base_after_prev - 1  # смещение на час раньше (10–1), если очень близко
 
-        # перебор разрешённых слотов для этого интервала
-        # правила: если ETA(prev->new) ≤15 → можно shifted (10–1), иначе — base (11–2)
-        # если prev отсутствует (первый возможный в середине дня) — ориентируемся на базовую сетку
+        # допустимые сеточные старты внутри интервала
         candidate_hours = []
         for h in GRID_STARTS:
-            # Слот должен хронологически идти после prev и до next (по сетке)
-            if prev and h <= prev[0].hour - 1:  # безопасная отсечка
+            if prev and h <= prev[0].hour - 1:
                 continue
-            if nxt and h >= nxt[0].hour + 1:    # не уходить далеко за next (контроль плотности)
+            if nxt and h >= nxt[0].hour + 1:
                 continue
             candidate_hours.append(h)
 
@@ -361,12 +386,12 @@ def build_candidates_for_day(
             if not within_client_window(s, e, day_start, day_end, win_start_str, win_end_str):
                 continue
 
-            # Проверяем правило ETA и смещения
             allow = False
             used_shift = False
             eta_prev = None
+
             if prev:
-                eta_prev = estimate_eta_minutes(prev[2], new_addr)
+                eta_prev = eta_minutes(prev[2], new_addr)
                 if eta_prev <= VERY_CLOSE_THRESH and h == shifted_after_prev:
                     allow = True
                     used_shift = True
@@ -375,26 +400,18 @@ def build_candidates_for_day(
                 else:
                     allow = False
             else:
-                # Нет предыдущего (теоретически это "первый в блоке между None и С"),
-                # используем базовую сетку без смещения
-                if h in GRID_STARTS:
-                    allow = True
+                allow = True  # первый кандидат между None и C
 
             if not allow:
                 continue
 
-            # Рассчитываем ETA к next/к дому, если слот последний
-            eta_next = None
-            if nxt:
-                eta_next = estimate_eta_minutes(new_addr, nxt[2])
-            else:
-                eta_next = eta_to_home(h)
+            # ETA к следующему визиту, либо к дому, если это «последний»
+            eta_next = eta_minutes(new_addr, nxt[2]) if nxt else (eta_minutes(new_addr, home_addr) if home_addr else None)
+            worst_eta = max([x for x in [eta_prev, eta_next] if x is not None], default=NORMAL_THRESH)
 
-            # Риск — по худшему из prev/next
-            worst_eta = max(eta for eta in [eta_prev, eta_next] if eta is not None)
             results.append({
                 "employee_id": emp_id,
-                "tech_name": NAME_MAP.get(emp_id, "Technician"),
+                "tech_name": resolve_name(emp_id),
                 "slot_start": s.isoformat(),
                 "slot_end": e.isoformat(),
                 "ETA_prev": eta_prev,
@@ -407,17 +424,10 @@ def build_candidates_for_day(
     return results
 
 # ====== MAIN ======
-class SuggestOut(BaseModel):
-    address: str
-    timezone: str
-    visit_minutes: int
-    suggestions: List[dict]
-
 @app.post("/suggest", response_model=SuggestOut)
 def suggest(body: SuggestIn):
     try:
         visit_minutes = body.visit_minutes or VISIT_MINUTES_DEFAULT
-        buffer_minutes = body.buffer_minutes or BUFFER_MINUTES_DEFAULT
 
         arrival_by_emp = collect_arrival_windows(days_ahead=body.days_ahead)
         if not arrival_by_emp:
@@ -431,25 +441,21 @@ def suggest(body: SuggestIn):
         now_local = datetime.now(APP_TZ)
         suggestions: List[dict] = []
 
-        # По каждому технику, по каждому дню горизонта
         for emp_id, windows in arrival_by_emp.items():
             # группируем по дате
             buckets: Dict[str, List[Tuple[datetime, datetime, str]]] = {}
             for ws, we, addr in windows:
-                key = ws.date().isoformat()
-                buckets.setdefault(key, []).append((ws, we, addr))
-            # проход по дням
+                buckets.setdefault(ws.date().isoformat(), []).append((ws, we, addr))
+
+            home = resolve_home(emp_id)
+
             for d in range(max(1, body.days_ahead)):
                 day_dt = now_local + timedelta(days=d)
                 day_key = day_dt.date().isoformat()
                 todays = sorted(buckets.get(day_key, []), key=lambda t: t[0])
 
-                # фильтр по дням недели (клиент «только ср и пт», например)
                 if body.preferred_days and weekday_code(day_dt) not in set(body.preferred_days):
                     continue
-
-                first_home = HOME_MAP.get(emp_id)
-                last_home  = HOME_MAP.get(emp_id)
 
                 cand = build_candidates_for_day(
                     emp_id=emp_id,
@@ -458,16 +464,15 @@ def suggest(body: SuggestIn):
                     new_addr=body.address,
                     win_start_str=body.window_start,
                     win_end_str=body.window_end,
-                    first_slot_home=first_home,
-                    last_slot_home=last_home
+                    home_addr=home
                 )
                 suggestions.extend(cand)
 
-        # Ранжирование: риск (low < medium < high), потом ближайшее время
+        # Ранжируем: риск (low < medium < high), затем ближайшее время
         risk_order = {"low": 0, "medium": 1, "high": 2}
-        suggestions.sort(key=lambda x: (risk_order.get(x.get("risk","medium"), 1), x["slot_start"]))
+        suggestions.sort(key=lambda x: (risk_order.get(x.get("risk", "medium"), 1), x["slot_start"]))
 
-        # Уберём возможные дубли по (tech, slot_start)
+        # дедуп по (tech, slot_start)
         seen = set()
         deduped = []
         for s in suggestions:
@@ -485,5 +490,10 @@ def suggest(body: SuggestIn):
         }
 
     except Exception as e:
-        # не падаем 502, а отдаём читаемую ошибку
-        return {"address": body.address, "timezone": str(APP_TZ), "visit_minutes": VISIT_MINUTES_DEFAULT, "suggestions": [], "error": str(e)}
+        return {
+            "address": body.address,
+            "timezone": str(APP_TZ),
+            "visit_minutes": VISIT_MINUTES_DEFAULT,
+            "suggestions": [],
+            "error": str(e)
+        }
