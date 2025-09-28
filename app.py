@@ -1,6 +1,6 @@
 import os
 from datetime import datetime, timedelta, time
-from typing import Any, Optional, List, Tuple, Dict
+from typing import Any, Optional, List, Tuple, Dict, Set
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 import requests
@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 APP_TZ = ZoneInfo(os.environ.get("TZ", "America/New_York"))
 HCP_KEY = os.environ.get("HCP_API_KEY")
 HCP_BASE = "https://api.housecallpro.com"
-GMAPS_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")  # Google Distance Matrix
+GMAPS_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
 
 # ====== NAMES & HOMES ======
 NAME_MAP: Dict[str, str] = {
@@ -19,7 +19,11 @@ NAME_MAP: Dict[str, str] = {
     "pro_e07e8bc2e5464dfdba36866c66a5f62d": "Vladimir Kovalev",
     "pro_17e6723ece4e47af95bcb6c1766bbb47": "Nick Litvinov",
 }
-HOME_MAP: Dict[str, str] = {}
+HOME_MAP: Dict[str, str] = {
+    # "pro_...": "City, ST"
+}
+
+ALEX_ID = "pro_5d48854aad6542a28f9da12d0c1b65f2"  # Saturday only Alex
 
 def resolve_name(emp_id: str) -> str:
     env_key = f"NAME_PRO_{emp_id}"
@@ -33,27 +37,31 @@ def resolve_home(emp_id: str) -> Optional[str]:
         return os.environ[env_key].strip()
     return HOME_MAP.get(emp_id)
 
-# ====== BUSINESS RULES (v4.3.3) ======
+# ====== BUSINESS RULES ======
 VISIT_MINUTES_DEFAULT = 120
 DEFAULT_WORK_START = time(9, 0)
 DEFAULT_WORK_END   = time(18, 0)
 
-VERY_CLOSE_THRESH = 15   # ≤15 → low
-NORMAL_THRESH     = 40   # 16..40 → medium; >40 → high
+VERY_CLOSE_THRESH = 15    # ≤15 -> low
+NORMAL_THRESH     = 40    # 16..40 -> medium; >40 -> high
 
-GRID_STARTS = [9, 10, 11, 12, 13, 14, 15]  # 3-часовые окна: 9–12..3–6
-ALEX_ID = "pro_5d48854aad6542a28f9da12d0c1b65f2"  # Суббота — только Alex
+GRID_STARTS = [9, 10, 11, 12, 13, 14, 15]  # 9–12..3–6
+
+# Overlap caps (v4.3.3+)
+MAX_OVERLAP_PREV_MIN = 60
+MAX_OVERLAP_NEXT_MIN = 60
+FULL_WINDOW_MIN      = 180  # never
 
 # ====== APP ======
-app = FastAPI(title="LocalPRO Scheduler Bridge (v4.3.3)")
+app = FastAPI(title="LocalPRO Scheduler Bridge (v4.3.4)")
 
 # ====== MODELS ======
 class SuggestIn(BaseModel):
     address: str
     days_ahead: int = 8
     preferred_days: Optional[List[str]] = None  # ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
-    window_start: Optional[str] = None          # "12:00"
-    window_end: Optional[str] = None            # "18:00"
+    window_start: Optional[str] = None
+    window_end: Optional[str] = None
     job_type: Optional[str] = None
     visit_minutes: Optional[int] = None
     buffer_minutes: Optional[int] = None
@@ -101,18 +109,6 @@ def hcp_paged_list(path: str, max_pages: int = 12, per_page: int = 100) -> List[
     return items
 
 # ====== UTIL ======
-def safe_city(addr_str: str) -> str:
-    try:
-        parts = [p.strip() for p in addr_str.split(",")]
-        for i in range(len(parts)-1):
-            if len(parts[i+1]) == 2 and parts[i+1].isalpha():
-                return parts[i]
-        if len(parts) >= 2:
-            return parts[-3] if len(parts) >= 3 else parts[1]
-        return addr_str
-    except Exception:
-        return addr_str
-
 def address_to_str(addr):
     if not isinstance(addr, dict):
         return str(addr)
@@ -223,21 +219,19 @@ def estimate_eta_heuristic(src_addr: str, dst_addr: str) -> int:
         try:
             parts = [p.strip() for p in a.split(",")]
             for i in range(len(parts)-1):
-                if len(parts[i+1]) == 2 and parts[i+1].isalpha():
+                if len(parts[i+1]) == 2 and p[i+1].isalpha():
                     return parts[i].lower()
+            if len(parts) >= 3:
+                return parts[-3].lower()
             if len(parts) >= 2:
-                return parts[-3].lower() if len(parts) >= 3 else parts[1].lower()
+                return parts[1].lower()
             return a.lower()
         except Exception:
             return a.lower()
-    a = city(src_addr or "")
-    b = city(dst_addr or "")
-    if not a or not b:
-        return 30
-    if a == b:
-        return 12
-    if a in NEAR_CITIES and b in NEAR_CITIES:
-        return 22
+    a = city(src_addr or ""); b = city(dst_addr or "")
+    if not a or not b: return 30
+    if a == b: return 12
+    if a in NEAR_CITIES and b in NEAR_CITIES: return 22
     return 45
 
 def eta_minutes(src_addr: str, dst_addr: str) -> int:
@@ -247,32 +241,53 @@ def eta_minutes(src_addr: str, dst_addr: str) -> int:
     return real if real is not None else estimate_eta_heuristic(src_addr, dst_addr)
 
 def risk_label(eta: int) -> str:
-    if eta <= VERY_CLOSE_THRESH:
-        return "low"
-    if eta <= NORMAL_THRESH:
-        return "medium"
+    if eta <= VERY_CLOSE_THRESH: return "low"
+    if eta <= NORMAL_THRESH:     return "medium"
     return "high"
+
+# ====== NAME TOKENS & ALIASES ======
+def name_tokens_for_emp(emp_id: str) -> Set[str]:
+    tokens: Set[str] = set()
+    full = resolve_name(emp_id)
+    for t in full.replace("-", " ").split():
+        t = t.strip()
+        if len(t) >= 2:
+            tokens.add(t.lower())
+    alias_key = f"ALIAS_PRO_{emp_id}"
+    if alias_key in os.environ and os.environ[alias_key].strip():
+        for t in os.environ[alias_key].replace(",", " ").split():
+            t = t.strip()
+            if len(t) >= 2:
+                tokens.add(t.lower())
+    return tokens
+
+def title_mentions_emp(title: str, emp_id: str) -> bool:
+    low = (title or "").lower()
+    for tok in name_tokens_for_emp(emp_id):
+        if tok and tok in low:
+            return True
+    return False
 
 # ====== EVENTS DETECTION ======
 EVENT_TYPE_KEYWORDS = {"event","block","blocked","calendar","personal","pto","vacation","meeting"}
 def looks_like_event_job(job: dict) -> bool:
     t1 = str(job.get("type") or "").lower()
     t2 = str(job.get("job_type") or "").lower()
-    title = (job.get("title") or job.get("summary") or job.get("name") or "").lower()
+    title = (job.get("title") or job.get("summary") or job.get("name") or "")
     no_service_addr = not (job.get("address") or job.get("service_address"))
     if any(k in t1 for k in EVENT_TYPE_KEYWORDS): return True
     if any(k in t2 for k in EVENT_TYPE_KEYWORDS): return True
-    if any(k in title for k in EVENT_TYPE_KEYWORDS): return True
+    if any(k in title.lower() for k in EVENT_TYPE_KEYWORDS): return True
     if no_service_addr: return True
-    for _, name in NAME_MAP.items():
-        if name.lower() in title:
+    # Имя техника (или алиас) в заголовке — считаем событийным блокатором
+    for emp_id in NAME_MAP.keys():
+        if title_mentions_emp(title, emp_id):
             return True
     return False
 
 def event_employee_id_from_title(title: str) -> Optional[str]:
-    low = (title or "").lower()
-    for emp_id, name in NAME_MAP.items():
-        if name.lower() in low:
+    for emp_id in NAME_MAP.keys():
+        if title_mentions_emp(title, emp_id):
             return emp_id
     return None
 
@@ -315,7 +330,6 @@ def debug_homes():
 
 @app.get("/debug/day")
 def debug_day(date: str = Query(..., description="YYYY-MM-DD")):
-    """Диагностика: какие окна (job/event) видим по техникам на дату."""
     arrival_by_emp = collect_arrival_windows(days_ahead=30)
     try:
         target = datetime.fromisoformat(date).date()
@@ -337,8 +351,7 @@ def debug_day(date: str = Query(..., description="YYYY-MM-DD")):
     return {"date": date, "seen": report}
 
 # ====== WINDOW TYPE ======
-# (win_start_local, win_end_local, address_str, is_event)
-Window = Tuple[datetime, datetime, str, bool]
+Window = Tuple[datetime, datetime, str, bool]  # (start, end, address/title, is_event)
 
 # ====== COLLECT ARRIVAL WINDOWS ======
 def try_collect_events_paged() -> List[dict]:
@@ -373,26 +386,32 @@ def event_employee_id(ev: dict) -> Optional[str]:
     return event_employee_id_from_title(ev.get("title") or ev.get("summary") or ev.get("name") or "")
 
 def collect_arrival_windows(days_ahead: int) -> Dict[str, List[Window]]:
-    """ arrival_by_emp[employee_id] = [(ws,we,addr,is_event), ...] """
     now_local = datetime.now(APP_TZ)
     horizon_end = now_local + timedelta(days=max(1, days_ahead))
     arrival_by_emp: Dict[str, List[Window]] = {}
 
-    # Jobs (paged)
+    # Jobs
     jobs = hcp_paged_list("/jobs")
     for j in jobs if isinstance(jobs, list) else []:
         start_utc, end_utc, emp_id, addr_str = pick_time_and_tech(j)
-        if not (start_utc and end_utc and emp_id):
+        if not (start_utc and end_utc):
             continue
         ws = to_local(start_utc); we = to_local(end_utc)
         if we < now_local or ws > horizon_end:
             continue
-        is_event_job = looks_like_event_job(j)
-        arrival_by_emp.setdefault(emp_id, []).append(
-            (ws, we, addr_str if not is_event_job else (j.get("title") or j.get("summary") or "Event"), is_event_job)
-        )
 
-    # Events (paged)
+        # Try to infer employee from title if missing
+        if not emp_id:
+            title = j.get("title") or j.get("summary") or j.get("name") or ""
+            emp_id = event_employee_id_from_title(title)
+
+        is_event_job = looks_like_event_job(j)
+        if emp_id:
+            arrival_by_emp.setdefault(emp_id, []).append(
+                (ws, we, addr_str if not is_event_job else (j.get("title") or j.get("summary") or "Event"), is_event_job)
+            )
+
+    # Events
     events = try_collect_events_paged()
     for ev in events:
         s_utc, e_utc = parse_event_time(ev)
@@ -438,56 +457,6 @@ def same_interval_exists(s: datetime, e: datetime, windows: List[Window]) -> boo
             return True
     return False
 
-# ====== NEW: hard caps for overlaps (v4.3.3) ======
-MAX_OVERLAP_PREV_MIN = 60   # раньше было 120 — теперь не более 1 часа
-MAX_OVERLAP_NEXT_MIN = 60   # было 60 — оставляем 60
-FULL_WINDOW_MIN = 180       # 3 часа — категорически нельзя
-
-def allowed_step_overlap(prev: Optional[Window],
-                         nxt: Optional[Window],
-                         new_s: datetime, new_e: datetime,
-                         eta_prev_min: Optional[int]) -> bool:
-    """
-    Разрешены только «ступени», причём любые overlaps ограничены ≤ 60 минут.
-    Полное перекрытие (180 минут) запрещено всегда.
-    Event-блокаторы запрещают любой overlap.
-    """
-    # prev
-    if prev:
-        prev_s, prev_e, _, prev_is_event = prev
-        if prev_is_event:
-            if overlaps(new_s, new_e, prev_s, prev_e):
-                return False
-        else:
-            cond_shifted = (new_s.hour == prev_s.hour + 1) and (eta_prev_min is not None and eta_prev_min <= VERY_CLOSE_THRESH)
-            cond_base    = (new_s.hour == prev_s.hour + 2)
-            if overlaps(new_s, new_e, prev_s, prev_e):
-                if not (cond_shifted or cond_base):
-                    return False
-                ov = overlap_minutes(new_s, new_e, prev_s, prev_e)
-                if ov >= FULL_WINDOW_MIN:
-                    return False
-                if ov > MAX_OVERLAP_PREV_MIN:
-                    return False
-
-    # next
-    if nxt:
-        nxt_s, nxt_e, _, nxt_is_event = nxt
-        if nxt_is_event:
-            if overlaps(new_s, new_e, nxt_s, nxt_e):
-                return False
-        else:
-            if overlaps(new_s, new_e, nxt_s, nxt_e):
-                if nxt_s.hour != new_s.hour + 2:
-                    return False
-                ov = overlap_minutes(new_s, new_e, nxt_s, nxt_e)
-                if ov >= FULL_WINDOW_MIN:
-                    return False
-                if ov > MAX_OVERLAP_NEXT_MIN:
-                    return False
-
-    return True
-
 # ====== BUILD CANDIDATES ======
 def build_candidates_for_day(
     emp_id: str,
@@ -501,9 +470,10 @@ def build_candidates_for_day(
     day_start = datetime.combine(dt_day.date(), DEFAULT_WORK_START, tzinfo=APP_TZ)
     day_end   = datetime.combine(dt_day.date(), DEFAULT_WORK_END, tzinfo=APP_TZ)
 
-    occupied_hours = set(ws.hour for ws, _, _, _ in todays_windows)
+    occupied_start_hours = set(ws.hour for ws, _, _, _ in todays_windows)  # safety: no same-hour start
     results: List[dict] = []
 
+    # Пустой день
     if not todays_windows:
         for h in GRID_STARTS:
             s, e = grid_slot(dt_day, h)
@@ -524,7 +494,7 @@ def build_candidates_for_day(
         nxt  = anchors[i+1] if anchors[i+1][0] is not None else None
 
         base_after_prev = 9 if not prev else prev[0].hour + 2
-        shifted_after_prev = base_after_prev - 1  # только при ETA ≤ 15
+        shifted_after_prev = base_after_prev - 1  # only if ETA ≤ 15
 
         candidate_hours = []
         for h in GRID_STARTS:
@@ -535,16 +505,18 @@ def build_candidates_for_day(
             candidate_hours.append(h)
 
         for h in candidate_hours:
+            # Жёсткий запрет старта в уже занятый час
+            if h in occupied_start_hours:
+                continue
+
             s, e = grid_slot(dt_day, h)
             if not within_client_window(s, e, day_start, day_end, win_start_str, win_end_str):
                 continue
 
-            if h in occupied_hours:
-                continue
             if same_interval_exists(s, e, todays_windows):
                 continue
 
-            # Первый визит дня (prev=None) не может перекрывать НИ одно окно (job/event)
+            # Первый визит дня не может перекрывать НИ одно окно
             if prev is None and overlapping_windows(s, e, todays_windows):
                 continue
 
@@ -559,6 +531,7 @@ def build_candidates_for_day(
 
             overlaps_list = overlapping_windows(s, e, todays_windows)
             if overlaps_list:
+                # Только prev/nxt и с жёсткими ограничениями
                 allowed_refs = set()
                 if prev: allowed_refs.add((prev[0], prev[1], prev[2], prev[3]))
                 if nxt:  allowed_refs.add((nxt[0], nxt[1], nxt[2], nxt[3]))
@@ -568,7 +541,28 @@ def build_candidates_for_day(
                         break
                 if overlaps_list is None:
                     continue
-                if not allowed_step_overlap(prev, nxt, s, e, eta_prev):
+
+                # Events всегда запрещают overlap
+                for ow in overlaps_list:
+                    if ow[3]:  # is_event
+                        overlaps_list = None
+                        break
+                if overlaps_list is None:
+                    continue
+
+                # Ограничиваем длительность перекрытий
+                ok = True
+                for ow in overlaps_list:
+                    ws, we, _, _ = ow
+                    ov = overlap_minutes(s, e, ws, we)
+                    if ov >= FULL_WINDOW_MIN:
+                        ok = False; break
+                    # Определим это prev или next
+                    if prev and ws == prev[0] and we == prev[1]:
+                        if ov > MAX_OVERLAP_PREV_MIN: ok = False; break
+                    if nxt and ws == nxt[0] and we == nxt[1]:
+                        if ov > MAX_OVERLAP_NEXT_MIN: ok = False; break
+                if not ok:
                     continue
 
             eta_next = eta_minutes(new_addr, nxt[2]) if nxt else (eta_minutes(new_addr, home_addr) if home_addr else None)
@@ -612,10 +606,10 @@ def suggest(body: SuggestIn):
                 day_key = day_dt.date().isoformat()
                 todays = sorted(buckets.get(day_key, []), key=lambda t: t[0])
 
-                dow = day_dt.weekday()  # Mon=0 .. Sun=6
+                dow = day_dt.weekday()  # Mon=0..Sun=6
                 if dow == 6:  # Sunday
                     continue
-                if dow == 5 and emp_id != ALEX_ID:  # Saturday only Alex
+                if dow == 5 and emp_id != ALEX_ID:
                     continue
 
                 if body.preferred_days and weekday_code(day_dt) not in set(body.preferred_days):
@@ -640,13 +634,7 @@ def suggest(body: SuggestIn):
             seen.add(key)
             deduped.append(s)
 
-        return {
-            "address": body.address,
-            "timezone": str(APP_TZ),
-            "visit_minutes": visit_minutes,
-            "suggestions": deduped[:50]
-        }
-
+        return {"address": body.address, "timezone": str(APP_TZ), "visit_minutes": visit_minutes, "suggestions": deduped[:50]}
     except Exception as e:
         return {"address": body.address, "timezone": str(APP_TZ), "visit_minutes": VISIT_MINUTES_DEFAULT, "suggestions": [], "error": str(e)}
 
