@@ -19,9 +19,7 @@ NAME_MAP: Dict[str, str] = {
     "pro_e07e8bc2e5464dfdba36866c66a5f62d": "Vladimir Kovalev",
     "pro_17e6723ece4e47af95bcb6c1766bbb47": "Nick Litvinov",
 }
-HOME_MAP: Dict[str, str] = {
-    # "pro_...": "City, ST"
-}
+HOME_MAP: Dict[str, str] = {}
 
 def resolve_name(emp_id: str) -> str:
     env_key = f"NAME_PRO_{emp_id}"
@@ -35,7 +33,7 @@ def resolve_home(emp_id: str) -> Optional[str]:
         return os.environ[env_key].strip()
     return HOME_MAP.get(emp_id)
 
-# ====== BUSINESS RULES (v4.3.2) ======
+# ====== BUSINESS RULES (v4.3.3) ======
 VISIT_MINUTES_DEFAULT = 120
 DEFAULT_WORK_START = time(9, 0)
 DEFAULT_WORK_END   = time(18, 0)
@@ -44,11 +42,10 @@ VERY_CLOSE_THRESH = 15   # ≤15 → low
 NORMAL_THRESH     = 40   # 16..40 → medium; >40 → high
 
 GRID_STARTS = [9, 10, 11, 12, 13, 14, 15]  # 3-часовые окна: 9–12..3–6
-
 ALEX_ID = "pro_5d48854aad6542a28f9da12d0c1b65f2"  # Суббота — только Alex
 
 # ====== APP ======
-app = FastAPI(title="LocalPRO Scheduler Bridge (v4.3.2)")
+app = FastAPI(title="LocalPRO Scheduler Bridge (v4.3.3)")
 
 # ====== MODELS ======
 class SuggestIn(BaseModel):
@@ -267,7 +264,6 @@ def looks_like_event_job(job: dict) -> bool:
     if any(k in t2 for k in EVENT_TYPE_KEYWORDS): return True
     if any(k in title for k in EVENT_TYPE_KEYWORDS): return True
     if no_service_addr: return True
-    # имя техника в заголовке — тоже считаем блокатором
     for _, name in NAME_MAP.items():
         if name.lower() in title:
             return True
@@ -392,7 +388,9 @@ def collect_arrival_windows(days_ahead: int) -> Dict[str, List[Window]]:
         if we < now_local or ws > horizon_end:
             continue
         is_event_job = looks_like_event_job(j)
-        arrival_by_emp.setdefault(emp_id, []).append((ws, we, addr_str if not is_event_job else (j.get("title") or j.get("summary") or "Event"), is_event_job))
+        arrival_by_emp.setdefault(emp_id, []).append(
+            (ws, we, addr_str if not is_event_job else (j.get("title") or j.get("summary") or "Event"), is_event_job)
+        )
 
     # Events (paged)
     events = try_collect_events_paged()
@@ -440,16 +438,21 @@ def same_interval_exists(s: datetime, e: datetime, windows: List[Window]) -> boo
             return True
     return False
 
+# ====== NEW: hard caps for overlaps (v4.3.3) ======
+MAX_OVERLAP_PREV_MIN = 60   # раньше было 120 — теперь не более 1 часа
+MAX_OVERLAP_NEXT_MIN = 60   # было 60 — оставляем 60
+FULL_WINDOW_MIN = 180       # 3 часа — категорически нельзя
+
 def allowed_step_overlap(prev: Optional[Window],
                          nxt: Optional[Window],
                          new_s: datetime, new_e: datetime,
                          eta_prev_min: Optional[int]) -> bool:
     """
-    Разрешены только «ступени»:
-    - с EVENT: любой overlap → запрещён
-    - с prev (JOB): shifted (prev+1h, ETA≤15) или base (prev+2h); overlap(prev,new) ≤ 120 мин
-    - с next (JOB): если overlap, то только при next.start == new.start+2h и overlap(new,next) ≤ 60 мин
+    Разрешены только «ступени», причём любые overlaps ограничены ≤ 60 минут.
+    Полное перекрытие (180 минут) запрещено всегда.
+    Event-блокаторы запрещают любой overlap.
     """
+    # prev
     if prev:
         prev_s, prev_e, _, prev_is_event = prev
         if prev_is_event:
@@ -461,8 +464,13 @@ def allowed_step_overlap(prev: Optional[Window],
             if overlaps(new_s, new_e, prev_s, prev_e):
                 if not (cond_shifted or cond_base):
                     return False
-                if overlap_minutes(new_s, new_e, prev_s, prev_e) > 120:
+                ov = overlap_minutes(new_s, new_e, prev_s, prev_e)
+                if ov >= FULL_WINDOW_MIN:
                     return False
+                if ov > MAX_OVERLAP_PREV_MIN:
+                    return False
+
+    # next
     if nxt:
         nxt_s, nxt_e, _, nxt_is_event = nxt
         if nxt_is_event:
@@ -472,8 +480,12 @@ def allowed_step_overlap(prev: Optional[Window],
             if overlaps(new_s, new_e, nxt_s, nxt_e):
                 if nxt_s.hour != new_s.hour + 2:
                     return False
-                if overlap_minutes(new_s, new_e, nxt_s, nxt_e) > 60:
+                ov = overlap_minutes(new_s, new_e, nxt_s, nxt_e)
+                if ov >= FULL_WINDOW_MIN:
                     return False
+                if ov > MAX_OVERLAP_NEXT_MIN:
+                    return False
+
     return True
 
 # ====== BUILD CANDIDATES ======
