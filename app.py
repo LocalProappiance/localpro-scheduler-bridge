@@ -15,16 +15,15 @@ HCP_BASE = "https://api.housecallpro.com"
 # Google Distance Matrix (реальный ETA)
 GMAPS_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")  # добавь в DO App Settings -> Environment Variables
 
-# === Фолбэк-имена техников (если ENV NAME_PRO_* не задан) ===
+# Фолбэк-имена (если ENV NAME_PRO_* не задан)
 NAME_MAP: Dict[str, str] = {
     "pro_5d48854aad6542a28f9da12d0c1b65f2": "Alex Yakush",
     "pro_e07e8bc2e5464dfdba36866c66a5f62d": "Vladimir Kovalev",
     "pro_17e6723ece4e47af95bcb6c1766bbb47": "Nick Litvinov",
 }
 
-# === Фолбэк-дома техников (если ENV HOME_PRO_* не задан) ===
+# Фолбэк-дома (если ENV HOME_PRO_* не задан)
 HOME_MAP: Dict[str, str] = {
-    # при желании можно прописать дефолты, но ENV приоритетнее
     # "pro_...": "City, ST"
 }
 
@@ -41,7 +40,7 @@ GRID_STARTS = [9, 10, 11, 12, 13, 14, 15]  # 9–12,10–1,11–2,12–3,1–4,2
 # ====== APP ======
 app = FastAPI(title="LocalPRO Scheduler Bridge")
 
-# ====== INPUT ======
+# ====== MODELS ======
 class SuggestIn(BaseModel):
     address: str
     days_ahead: int = 3
@@ -186,7 +185,6 @@ def resolve_home(emp_id: str) -> Optional[str]:
     return HOME_MAP.get(emp_id)
 
 # ====== ETA ======
-# эвристика (если нет ключа Google)
 CITY_EQ_MIN   = 12
 CITY_NEAR_MIN = 22
 CITY_FAR_MIN  = 35
@@ -339,7 +337,7 @@ def build_candidates_for_day(
     # Если нет визитов в этот день — опираемся на дом техника
     if not todays_windows:
         for h in GRID_STARTS:
-            if h in occupied_hours:  # на всякий случай
+            if h in occupied_hours:
                 continue
             s, e = grid_slot(dt_day, h)
             if not within_client_window(s, e, day_start, day_end, win_start_str, win_end_str):
@@ -423,7 +421,7 @@ def build_candidates_for_day(
 
     return results
 
-# ====== MAIN ======
+# ====== MAIN JSON ======
 @app.post("/suggest", response_model=SuggestOut)
 def suggest(body: SuggestIn):
     try:
@@ -486,7 +484,7 @@ def suggest(body: SuggestIn):
             "address": body.address,
             "timezone": str(APP_TZ),
             "visit_minutes": visit_minutes,
-            "suggestions": deduped[:6]
+            "suggestions": deduped[:50]  # оставим побольше, компактный вывод сам сгруппирует
         }
 
     except Exception as e:
@@ -497,3 +495,49 @@ def suggest(body: SuggestIn):
             "suggestions": [],
             "error": str(e)
         }
+
+# ====== COMPACT TEXT OUTPUT ======
+def _fmt_hour(dt: datetime) -> str:
+    # "9am" / "12pm" / "1pm"
+    hh = dt.hour
+    suf = "am" if hh < 12 else "pm"
+    base = hh if 1 <= hh <= 12 else (hh - 12 if hh > 12 else 12)
+    return f"{base}{suf}"
+
+def _slot_human(start_iso: str, end_iso: str) -> str:
+    s = datetime.fromisoformat(start_iso).astimezone(APP_TZ)
+    e = datetime.fromisoformat(end_iso).astimezone(APP_TZ)
+    return f"{_fmt_hour(s)}–{_fmt_hour(e)}"
+
+def format_compact(suggestions: List[dict]) -> str:
+    # Группировка: (tech, date_str) -> [ "12–3 (low)", ... ]
+    grouped: Dict[Tuple[str, str], List[str]] = {}
+    order_keys: List[Tuple[str, str]] = []
+    for s in suggestions:
+        tech = s.get("tech_name") or "Technician"
+        dt = datetime.fromisoformat(s["slot_start"]).astimezone(APP_TZ).strftime("%a %m/%d")
+        slot_label = _slot_human(s["slot_start"], s["slot_end"])
+        risk = s.get("risk", "")
+        item = f"{slot_label} ({risk})" if risk else slot_label
+        key = (tech, dt)
+        if key not in grouped:
+            grouped[key] = []
+            order_keys.append(key)
+        grouped[key].append(item)
+
+    lines = []
+    for tech, dt in order_keys:
+        lines.append(f"{tech} ({dt}): " + ", ".join(grouped[(tech, dt)]))
+    return "\n".join(lines)
+
+@app.post("/suggest-compact")
+def suggest_compact(body: SuggestIn):
+    raw = suggest(body)  # используем логику /suggest
+    if isinstance(raw, dict) and "suggestions" in raw:
+        text = format_compact(raw["suggestions"])
+        return {
+            "address": raw["address"],
+            "timezone": raw["timezone"],
+            "summary": text
+        }
+    return {"error": "failed"}
