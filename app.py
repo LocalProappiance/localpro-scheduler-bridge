@@ -1,3 +1,4 @@
+# app.py
 import os
 from datetime import datetime, timedelta, time
 from typing import Any, Optional, List, Tuple, Dict, Set
@@ -47,13 +48,13 @@ NORMAL_THRESH     = 40    # 16..40 -> medium; >40 -> high
 
 GRID_STARTS = [9, 10, 11, 12, 13, 14, 15]  # 9–12..3–6
 
-# Overlap caps (v4.3.3+)
+# Overlap caps (v4.3.5)
 MAX_OVERLAP_PREV_MIN = 60
 MAX_OVERLAP_NEXT_MIN = 60
 FULL_WINDOW_MIN      = 180  # never
 
 # ====== APP ======
-app = FastAPI(title="LocalPRO Scheduler Bridge (v4.3.4)")
+app = FastAPI(title="LocalPRO Scheduler Bridge (v4.3.5)")
 
 # ====== MODELS ======
 class SuggestIn(BaseModel):
@@ -155,6 +156,45 @@ def _walk(obj: Any, path=""):
     else:
         yield (path, obj)
 
+# ====== EMP ID EXTRACTION (robust) ======
+def _collect_emp_ids(obj: Any) -> Set[str]:
+    """Ищем ID техника в разных структурах: assigned_employees, employees, participants, employee_id и т.п."""
+    ids: Set[str] = set()
+    if obj is None:
+        return ids
+
+    def add_id(val):
+        if not val:
+            return
+        s = str(val).strip()
+        if s.startswith("pro_") and len(s) > 4:
+            ids.add(s)
+
+    if isinstance(obj, dict):
+        # Списковые поля с сотрудниками
+        for k in ["assigned_employees", "employees", "participants", "assignees"]:
+            if k in obj and isinstance(obj[k], list):
+                for it in obj[k]:
+                    if isinstance(it, dict):
+                        add_id(it.get("id") or it.get("employee_id") or it.get("pro_id"))
+                    else:
+                        add_id(it)
+
+        # Прямые поля
+        for k in ["employee_id", "pro_id", "tech_id", "assignee_id"]:
+            if k in obj:
+                add_id(obj[k])
+
+        # Вложенный объект employee
+        if "employee" in obj and isinstance(obj["employee"], dict):
+            add_id(obj["employee"].get("id"))
+
+    elif isinstance(obj, list):
+        for it in obj:
+            ids |= _collect_emp_ids(it)
+
+    return ids
+
 def pick_time_and_tech(job: dict) -> Tuple[Optional[datetime], Optional[datetime], Optional[str], str]:
     start_utc = end_utc = None
     employee_id = None
@@ -169,11 +209,10 @@ def pick_time_and_tech(job: dict) -> Tuple[Optional[datetime], Optional[datetime
         try: end_utc = parse_iso_utc(e)
         except Exception: end_utc = None
 
-    assigned_employees = job.get("assigned_employees")
-    if isinstance(assigned_employees, list) and assigned_employees:
-        first = assigned_employees[0]
-        if isinstance(first, dict):
-            employee_id = first.get("id")
+    # Надёжное извлечение employee_id
+    emp_ids = _collect_emp_ids(job)
+    if emp_ids:
+        employee_id = next(iter(emp_ids))
 
     addr_str = address_to_str(job.get("address") or job.get("service_address") or {})
 
@@ -219,7 +258,8 @@ def estimate_eta_heuristic(src_addr: str, dst_addr: str) -> int:
         try:
             parts = [p.strip() for p in a.split(",")]
             for i in range(len(parts)-1):
-                if len(parts[i+1]) == 2 and p[i+1].isalpha():
+                # если следующая часть похожа на штат (FL, GA)
+                if len(parts[i+1]) == 2 and parts[i+1].isalpha():
                     return parts[i].lower()
             if len(parts) >= 3:
                 return parts[-3].lower()
@@ -291,6 +331,33 @@ def event_employee_id_from_title(title: str) -> Optional[str]:
             return emp_id
     return None
 
+def parse_event_time(ev: dict) -> Tuple[Optional[datetime], Optional[datetime]]:
+    for k_start, k_end in [
+        ("start", "end"),
+        ("scheduled_start", "scheduled_end"),
+        ("starts_at", "ends_at"),
+        ("start_time", "end_time"),
+    ]:
+        s = ev.get(k_start); e = ev.get(k_end)
+        if isinstance(s, str) and isinstance(e, str):
+            try: return parse_iso_utc(s), parse_iso_utc(e)
+            except Exception: pass
+    sch = ev.get("schedule") or {}
+    s = sch.get("scheduled_start"); e = sch.get("scheduled_end")
+    if isinstance(s, str) and isinstance(e, str):
+        try: return parse_iso_utc(s), parse_iso_utc(e)
+        except Exception: pass
+    return None, None
+
+def event_employee_id(ev: dict) -> Optional[str]:
+    # 1) пробуем структурные поля
+    ids = _collect_emp_ids(ev)
+    if ids:
+        return next(iter(ids))
+    # 2) fallback: по заголовку
+    title = ev.get("title") or ev.get("summary") or ev.get("name") or ""
+    return event_employee_id_from_title(title)
+
 # ====== DEBUG ======
 @app.get("/health")
 def health():
@@ -350,6 +417,22 @@ def debug_day(date: str = Query(..., description="YYYY-MM-DD")):
             report[resolve_name(emp_id)] = lines
     return {"date": date, "seen": report}
 
+@app.get("/debug/events-orphaned")
+def debug_events_orphaned():
+    orphaned = []
+    for ev in try_collect_events_paged():
+        s_utc, e_utc = parse_event_time(ev)
+        if not (s_utc and e_utc):
+            continue
+        emp = event_employee_id(ev)
+        if not emp:
+            orphaned.append({
+                "title": ev.get("title") or ev.get("summary") or ev.get("name"),
+                "start_utc": s_utc.isoformat(), "end_utc": e_utc.isoformat(),
+                "raw": {"assigned_employees": ev.get("assigned_employees")}
+            })
+    return {"orphaned_count": len(orphaned), "items": orphaned[:50]}
+
 # ====== WINDOW TYPE ======
 Window = Tuple[datetime, datetime, str, bool]  # (start, end, address/title, is_event)
 
@@ -359,31 +442,6 @@ def try_collect_events_paged() -> List[dict]:
         return hcp_paged_list("/events")
     except Exception:
         return []
-
-def parse_event_time(ev: dict) -> Tuple[Optional[datetime], Optional[datetime]]:
-    for k_start, k_end in [
-        ("start", "end"),
-        ("scheduled_start", "scheduled_end"),
-        ("starts_at", "ends_at"),
-        ("start_time", "end_time"),
-    ]:
-        s = ev.get(k_start); e = ev.get(k_end)
-        if isinstance(s, str) and isinstance(e, str):
-            try: return parse_iso_utc(s), parse_iso_utc(e)
-            except Exception: pass
-    sch = ev.get("schedule") or {}
-    s = sch.get("scheduled_start"); e = sch.get("scheduled_end")
-    if isinstance(s, str) and isinstance(e, str):
-        try: return parse_iso_utc(s), parse_iso_utc(e)
-        except Exception: pass
-    return None, None
-
-def event_employee_id(ev: dict) -> Optional[str]:
-    ae = ev.get("assigned_employees")
-    if isinstance(ae, list) and ae:
-        if isinstance(ae[0], dict) and ae[0].get("id"):
-            return ae[0]["id"]
-    return event_employee_id_from_title(ev.get("title") or ev.get("summary") or ev.get("name") or "")
 
 def collect_arrival_windows(days_ahead: int) -> Dict[str, List[Window]]:
     now_local = datetime.now(APP_TZ)
