@@ -48,13 +48,14 @@ NORMAL_THRESH     = 40    # 16..40 -> medium; >40 -> high
 
 GRID_STARTS = [9, 10, 11, 12, 13, 14, 15]  # 9–12..3–6
 
-# Overlap caps (v4.3.5)
+# Overlap caps (v4.3.6)
 MAX_OVERLAP_PREV_MIN = 60
 MAX_OVERLAP_NEXT_MIN = 60
 FULL_WINDOW_MIN      = 180  # never
+MAX_OVERLAP_TOTAL_MIN = 60  # <— новое: суммарное перекрытие с работами за слот
 
 # ====== APP ======
-app = FastAPI(title="LocalPRO Scheduler Bridge (v4.3.5)")
+app = FastAPI(title="LocalPRO Scheduler Bridge (v4.3.6)")
 
 # ====== MODELS ======
 class SuggestIn(BaseModel):
@@ -195,6 +196,7 @@ def _collect_emp_ids(obj: Any) -> Set[str]:
 
     return ids
 
+# ====== TIME & TECH FROM JOB ======
 def pick_time_and_tech(job: dict) -> Tuple[Optional[datetime], Optional[datetime], Optional[str], str]:
     start_utc = end_utc = None
     employee_id = None
@@ -209,7 +211,6 @@ def pick_time_and_tech(job: dict) -> Tuple[Optional[datetime], Optional[datetime
         try: end_utc = parse_iso_utc(e)
         except Exception: end_utc = None
 
-    # Надёжное извлечение employee_id
     emp_ids = _collect_emp_ids(job)
     if emp_ids:
         employee_id = next(iter(emp_ids))
@@ -258,7 +259,6 @@ def estimate_eta_heuristic(src_addr: str, dst_addr: str) -> int:
         try:
             parts = [p.strip() for p in a.split(",")]
             for i in range(len(parts)-1):
-                # если следующая часть похожа на штат (FL, GA)
                 if len(parts[i+1]) == 2 and parts[i+1].isalpha():
                     return parts[i].lower()
             if len(parts) >= 3:
@@ -309,7 +309,7 @@ def title_mentions_emp(title: str, emp_id: str) -> bool:
     return False
 
 # ====== EVENTS DETECTION ======
-EVENT_TYPE_KEYWORDS = {"event","block","blocked","calendar","personal","pto","vacation","meeting"}
+EVENT_TYPE_KEYWORDS = {"event","block","blocked","calendar","personal","pto","vacation","meeting","busy","not available","ooO","ooo"}
 def looks_like_event_job(job: dict) -> bool:
     t1 = str(job.get("type") or "").lower()
     t2 = str(job.get("job_type") or "").lower()
@@ -319,7 +319,6 @@ def looks_like_event_job(job: dict) -> bool:
     if any(k in t2 for k in EVENT_TYPE_KEYWORDS): return True
     if any(k in title.lower() for k in EVENT_TYPE_KEYWORDS): return True
     if no_service_addr: return True
-    # Имя техника (или алиас) в заголовке — считаем событийным блокатором
     for emp_id in NAME_MAP.keys():
         if title_mentions_emp(title, emp_id):
             return True
@@ -350,11 +349,9 @@ def parse_event_time(ev: dict) -> Tuple[Optional[datetime], Optional[datetime]]:
     return None, None
 
 def event_employee_id(ev: dict) -> Optional[str]:
-    # 1) пробуем структурные поля
     ids = _collect_emp_ids(ev)
     if ids:
         return next(iter(ids))
-    # 2) fallback: по заголовку
     title = ev.get("title") or ev.get("summary") or ev.get("name") or ""
     return event_employee_id_from_title(title)
 
@@ -458,7 +455,6 @@ def collect_arrival_windows(days_ahead: int) -> Dict[str, List[Window]]:
         if we < now_local or ws > horizon_end:
             continue
 
-        # Try to infer employee from title if missing
         if not emp_id:
             title = j.get("title") or j.get("summary") or j.get("name") or ""
             emp_id = event_employee_id_from_title(title)
@@ -473,15 +469,25 @@ def collect_arrival_windows(days_ahead: int) -> Dict[str, List[Window]]:
     events = try_collect_events_paged()
     for ev in events:
         s_utc, e_utc = parse_event_time(ev)
+        title = ev.get("title") or ev.get("summary") or ev.get("name") or "Event"
         emp_id = event_employee_id(ev)
-        if not (s_utc and e_utc and emp_id):
+        if not (s_utc and e_utc):
             continue
         ws = to_local(s_utc); we = to_local(e_utc)
         if we < now_local or ws > horizon_end:
             continue
-        addr_str = address_to_str(ev.get("address") or {}) or (ev.get("title") or ev.get("summary") or "Event")
-        arrival_by_emp.setdefault(emp_id, []).append((ws, we, addr_str, True))
 
+        addr_or_title = address_to_str(ev.get("address") or {}) or title
+
+        if emp_id:
+            # Нормальный случай: евент привязан к технику
+            arrival_by_emp.setdefault(emp_id, []).append((ws, we, addr_or_title, True))
+        else:
+            # Глобальный блок: нет ID техника — распространяем на всех известных техников
+            for all_emp in NAME_MAP.keys():
+                arrival_by_emp.setdefault(all_emp, []).append((ws, we, title, True))
+
+    # Сортировка по времени
     for emp_id in arrival_by_emp:
         arrival_by_emp[emp_id].sort(key=lambda t: t[0])
     return arrival_by_emp
@@ -589,38 +595,42 @@ def build_candidates_for_day(
 
             overlaps_list = overlapping_windows(s, e, todays_windows)
             if overlaps_list:
-                # Только prev/nxt и с жёсткими ограничениями
+                # Полный запрет пересечений с евентами
+                if any(ow[3] for ow in overlaps_list):  # is_event
+                    continue
+
+                # Разрешаем перекрытие только с ОДНИМ окном (prev ИЛИ next), суммарно ≤ 60 минут
+                # и внутри индивидуальных лимитов prev/next
                 allowed_refs = set()
                 if prev: allowed_refs.add((prev[0], prev[1], prev[2], prev[3]))
                 if nxt:  allowed_refs.add((nxt[0], nxt[1], nxt[2], nxt[3]))
-                for ow in overlaps_list:
-                    if ow not in allowed_refs:
-                        overlaps_list = None
-                        break
-                if overlaps_list is None:
+
+                # Все пересечения должны быть только с prev или только с next (не одновременно)
+                if any(ow not in allowed_refs for ow in overlaps_list):
+                    continue
+                if len(overlaps_list) > 1:
+                    # даже если оба допустимых, на практике это «между двумя» — запрещаем
                     continue
 
-                # Events всегда запрещают overlap
-                for ow in overlaps_list:
-                    if ow[3]:  # is_event
-                        overlaps_list = None
-                        break
-                if overlaps_list is None:
+                ow = overlaps_list[0]
+                ws, we, _, _ = ow
+                ov = overlap_minutes(s, e, ws, we)
+                if ov >= FULL_WINDOW_MIN:
                     continue
 
-                # Ограничиваем длительность перекрытий
-                ok = True
-                for ow in overlaps_list:
-                    ws, we, _, _ = ow
-                    ov = overlap_minutes(s, e, ws, we)
-                    if ov >= FULL_WINDOW_MIN:
-                        ok = False; break
-                    # Определим это prev или next
-                    if prev and ws == prev[0] and we == prev[1]:
-                        if ov > MAX_OVERLAP_PREV_MIN: ok = False; break
-                    if nxt and ws == nxt[0] and we == nxt[1]:
-                        if ov > MAX_OVERLAP_NEXT_MIN: ok = False; break
-                if not ok:
+                # Определим это prev или next и применим соответствующий лимит
+                if prev and ws == prev[0] and we == prev[1]:
+                    if ov > MAX_OVERLAP_PREV_MIN: 
+                        continue
+                elif nxt and ws == nxt[0] and we == nxt[1]:
+                    if ov > MAX_OVERLAP_NEXT_MIN: 
+                        continue
+                else:
+                    # теоретически не должно попадать сюда
+                    continue
+
+                # Суммарный лимит (на всякий случай, если логика выше изменится)
+                if ov > MAX_OVERLAP_TOTAL_MIN:
                     continue
 
             eta_next = eta_minutes(new_addr, nxt[2]) if nxt else (eta_minutes(new_addr, home_addr) if home_addr else None)
