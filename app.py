@@ -13,43 +13,46 @@ HCP_KEY = os.environ.get("HCP_API_KEY")
 HCP_BASE = "https://api.housecallpro.com"
 
 # Google Distance Matrix (реальный ETA)
-GMAPS_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")  # добавь в DO App Settings -> Environment Variables
+GMAPS_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
 
-# Фолбэк-имена (если ENV NAME_PRO_* не задан)
+# === Фолбэк-имена (если ENV NAME_PRO_* не задан) ===
 NAME_MAP: Dict[str, str] = {
     "pro_5d48854aad6542a28f9da12d0c1b65f2": "Alex Yakush",
     "pro_e07e8bc2e5464dfdba36866c66a5f62d": "Vladimir Kovalev",
     "pro_17e6723ece4e47af95bcb6c1766bbb47": "Nick Litvinov",
 }
 
-# Фолбэк-дома (если ENV HOME_PRO_* не задан)
+# === Фолбэк-дома (если ENV HOME_PRO_* не задан) ===
 HOME_MAP: Dict[str, str] = {
     # "pro_...": "City, ST"
 }
 
-# Бизнес-правила (политика v3)
-VISIT_MINUTES_DEFAULT = 120    # информативно; окна прибытия = 3ч
+# Бизнес-правила (политика v4)
+VISIT_MINUTES_DEFAULT = 120
 DEFAULT_WORK_START = time(9, 0)
 DEFAULT_WORK_END   = time(18, 0)
-VERY_CLOSE_THRESH  = 15        # ETA ≤ 15 → смещённое окно разрешено (10–1 и т.п.)
-NORMAL_THRESH      = 30        # 15–30 → обычная ступенька 11–2; >30 — тоже можно 11–2 (просто "high" риск)
+VERY_CLOSE_THRESH  = 15        # ETA ≤ 15 → смещённая ступень (10–1) разрешена
+NORMAL_THRESH      = 30        # 15–30 → соседняя ступень (11–2); >30 тоже 11–2 допустимо
 
 # Допустимые 3-часовые окна по целому часу
 GRID_STARTS = [9, 10, 11, 12, 13, 14, 15]  # 9–12,10–1,11–2,12–3,1–4,2–5,3–6
 
+# Суббота: работает только Alex Yakush
+ALEX_ID = "pro_5d48854aad6542a28f9da12d0c1b65f2"
+
 # ====== APP ======
-app = FastAPI(title="LocalPRO Scheduler Bridge")
+app = FastAPI(title="LocalPRO Scheduler Bridge (v4)")
 
 # ====== MODELS ======
 class SuggestIn(BaseModel):
     address: str
     days_ahead: int = 3
     preferred_days: Optional[List[str]] = None  # ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
-    window_start: Optional[str] = None          # например "12:00" (только после 12)
-    window_end: Optional[str] = None            # например "18:00"
+    window_start: Optional[str] = None          # "12:00"
+    window_end: Optional[str] = None            # "18:00"
     job_type: Optional[str] = None
-    visit_minutes: Optional[int] = None         # информативно
-    buffer_minutes: Optional[int] = None        # не используется в логике v3 (оставлено для совместимости)
+    visit_minutes: Optional[int] = None
+    buffer_minutes: Optional[int] = None
 
 class SuggestOut(BaseModel):
     address: str
@@ -171,7 +174,7 @@ def pick_time_and_tech(job: dict) -> Tuple[Optional[datetime], Optional[datetime
 
     return start_utc, end_utc, employee_id, addr_str
 
-# ====== RESOLVERS: name & home из ENV с фолбэком ======
+# ====== RESOLVERS ======
 def resolve_name(emp_id: str) -> str:
     env_key = f"NAME_PRO_{emp_id}"
     if env_key in os.environ and os.environ[env_key].strip():
@@ -306,7 +309,7 @@ def collect_arrival_windows(days_ahead: int) -> Dict[str, List[Tuple[datetime, d
         arrival_by_emp[emp_id].sort(key=lambda t: t[0])
     return arrival_by_emp
 
-# ====== GRID UTILS ======
+# ====== GRID UTILS & OVERLAP RULES ======
 def grid_slot(dt_day: datetime, start_hour: int) -> Tuple[datetime, datetime]:
     s = datetime.combine(dt_day.date(), time(start_hour, 0), tzinfo=APP_TZ)
     e = s + timedelta(hours=3)
@@ -318,7 +321,52 @@ def within_client_window(s: datetime, e: datetime, day_start: datetime, day_end:
     cl_e = from_local(day_start, win_end_str) or day_end
     return (s >= cl_s) and (e <= cl_e)
 
-# ====== BUILD CANDIDATES (POLICY v3 + real ETA) ======
+def overlaps(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
+    return max(a_start, b_start) < min(a_end, b_end)
+
+def overlaps_any(s: datetime, e: datetime, windows: List[Tuple[datetime, datetime, str]]) -> bool:
+    for ws, we, _ in windows:
+        if overlaps(s, e, ws, we):
+            return True
+    return False
+
+def allowed_step_overlap(prev: Optional[Tuple[datetime, datetime, str]],
+                         nxt: Optional[Tuple[datetime, datetime, str]],
+                         new_s: datetime, new_e: datetime,
+                         eta_prev_min: Optional[int]) -> bool:
+    """
+    Разрешает перекрытия ТОЛЬКО “ступеньками” согласно v4.
+    - с prev: new.start == prev.start+1ч (и ETA ≤ 15) ИЛИ new.start == prev.start+2ч
+    - с next: допускаем пересечение только если next.start == new.start+2ч
+    Любые другие пересечения запрещены.
+    """
+    ok_prev = True
+    ok_next = True
+
+    if prev:
+        prev_s, prev_e, _ = prev
+        # базовые часы
+        prev_start_hour = prev_s.hour
+        # требования:
+        # 1) смещённая ступень: new_s.hour == prev_start_hour + 1 И eta_prev ≤ 15
+        # 2) соседняя ступень: new_s.hour == prev_start_hour + 2
+        cond_shifted = (new_s.hour == prev_start_hour + 1) and (eta_prev_min is not None and eta_prev_min <= VERY_CLOSE_THRESH)
+        cond_base    = (new_s.hour == prev_start_hour + 2)
+        # если есть какое-то пересечение с prev, то оно допустимо только по одному из условий
+        if overlaps(new_s, new_e, prev_s, prev_e):
+            ok_prev = cond_shifted or cond_base
+
+    if nxt:
+        nxt_s, nxt_e, _ = nxt
+        nxt_start_hour = nxt_s.hour
+        # Допустимо пересекаться с next только если он начинается через 2 часа от new.start
+        cond_next = (nxt_start_hour == new_s.hour + 2)
+        if overlaps(new_s, new_e, nxt_s, nxt_e):
+            ok_next = cond_next
+
+    return ok_prev and ok_next
+
+# ====== BUILD CANDIDATES (POLICY v4 + real ETA) ======
 def build_candidates_for_day(
     emp_id: str,
     dt_day: datetime,
@@ -334,14 +382,13 @@ def build_candidates_for_day(
     occupied_hours = set(ws.hour for ws, _, _ in todays_windows)
     results: List[dict] = []
 
-    # Если нет визитов в этот день — опираемся на дом техника
+    # Пустой день у техника — опираемся на дом техника
     if not todays_windows:
         for h in GRID_STARTS:
-            if h in occupied_hours:
-                continue
             s, e = grid_slot(dt_day, h)
             if not within_client_window(s, e, day_start, day_end, win_start_str, win_end_str):
                 continue
+            # нет пересечений в пустой день, но оставим общий шаблон
             eta_from_home = eta_minutes(home_addr, new_addr) if home_addr else NORMAL_THRESH
             results.append({
                 "employee_id": emp_id,
@@ -355,20 +402,17 @@ def build_candidates_for_day(
             })
         return results
 
+    # День с визитами — рассматриваем «окна» между prev и next, включая «хвост»
     anchors = [(None, None, None)] + todays_windows + [(None, None, None)]
     for i in range(len(anchors)-1):
-        A = anchors[i]
-        C = anchors[i+1]
-        prev = A if A[0] is not None else None
-        nxt  = C if C[0] is not None else None
+        prev = anchors[i] if anchors[i][0] is not None else None
+        nxt  = anchors[i+1] if anchors[i+1][0] is not None else None
 
-        # базовая «соседняя ступенька» после prev (9->11, 11->13, ...)
-        base_after_prev = 9
-        if prev:
-            base_after_prev = prev[0].hour + 2
-        shifted_after_prev = base_after_prev - 1  # смещение на час раньше (10–1), если очень близко
+        # базовая соседняя ступень после prev (9->11, 11->13, ...)
+        base_after_prev = 9 if not prev else prev[0].hour + 2
+        shifted_after_prev = base_after_prev - 1  # смещённая (10–1), только при ETA ≤ 15
 
-        # допустимые сеточные старты внутри интервала
+        # кандидаты: только сеточные старты внутри разумных границ
         candidate_hours = []
         for h in GRID_STARTS:
             if prev and h <= prev[0].hour - 1:
@@ -378,34 +422,41 @@ def build_candidates_for_day(
             candidate_hours.append(h)
 
         for h in candidate_hours:
-            if h in occupied_hours:
-                continue
             s, e = grid_slot(dt_day, h)
             if not within_client_window(s, e, day_start, day_end, win_start_str, win_end_str):
                 continue
 
-            allow = False
-            used_shift = False
-            eta_prev = None
-
-            if prev:
-                eta_prev = eta_minutes(prev[2], new_addr)
-                if eta_prev <= VERY_CLOSE_THRESH and h == shifted_after_prev:
-                    allow = True
-                    used_shift = True
-                elif h == base_after_prev:
-                    allow = True
-                else:
-                    allow = False
-            else:
-                allow = True  # первый кандидат между None и C
-
-            if not allow:
+            # Запрет «стартовать» ровно в тот же час, что уже занятый слот в этот день
+            if h in occupied_hours:
                 continue
 
-            # ETA к следующему визиту, либо к дому, если это «последний»
+            # Предварительная проверка допустимости по “ступенькам” (политика v4)
+            eta_prev = None
+            if prev:
+                eta_prev = eta_minutes(prev[2], new_addr)
+                if h == shifted_after_prev and not (eta_prev is not None and eta_prev <= VERY_CLOSE_THRESH):
+                    # смещённый час без условия близости — нельзя
+                    continue
+                if not (h == base_after_prev or h == shifted_after_prev):
+                    # из «блока после prev» разрешаем только соседнюю ступеньку или смещённую
+                    # (если prev отсутствует — ниже позволим базовую сетку)
+                    continue
+
+            # Если prev отсутствует (теоретически первый блок) — можно базовую сетку
+
+            # Если пересекается с чьим-то окном — разрешаем ТОЛЬКО если это “ступенька” по правилам
+            if overlaps_any(s, e, todays_windows):
+                if not allowed_step_overlap(prev, nxt, s, e, eta_prev):
+                    continue  # ЛЮБОЕ иное пересечение — запрещено
+
+            # Оценка ETA к следующему/к дому для риска
             eta_next = eta_minutes(new_addr, nxt[2]) if nxt else (eta_minutes(new_addr, home_addr) if home_addr else None)
             worst_eta = max([x for x in [eta_prev, eta_next] if x is not None], default=NORMAL_THRESH)
+
+            used_shift = (prev is not None and h == shifted_after_prev and eta_prev is not None and eta_prev <= VERY_CLOSE_THRESH)
+            note = ("shifted (<=15min)" if used_shift else ("base step" if prev else "between blocks"))
+            if nxt is None:
+                note += "; last of day (home)"
 
             results.append({
                 "employee_id": emp_id,
@@ -415,8 +466,7 @@ def build_candidates_for_day(
                 "ETA_prev": eta_prev,
                 "ETA_next": eta_next,
                 "risk": risk_label(worst_eta),
-                "note": ("shifted (<=15min)" if used_shift else "base step")
-                        + ("; last of day (home)" if nxt is None else "")
+                "note": note
             })
 
     return results
@@ -426,15 +476,9 @@ def build_candidates_for_day(
 def suggest(body: SuggestIn):
     try:
         visit_minutes = body.visit_minutes or VISIT_MINUTES_DEFAULT
-
         arrival_by_emp = collect_arrival_windows(days_ahead=body.days_ahead)
         if not arrival_by_emp:
-            return {
-                "address": body.address,
-                "timezone": str(APP_TZ),
-                "visit_minutes": visit_minutes,
-                "suggestions": []
-            }
+            return {"address": body.address, "timezone": str(APP_TZ), "visit_minutes": visit_minutes, "suggestions": []}
 
         now_local = datetime.now(APP_TZ)
         suggestions: List[dict] = []
@@ -452,6 +496,14 @@ def suggest(body: SuggestIn):
                 day_key = day_dt.date().isoformat()
                 todays = sorted(buckets.get(day_key, []), key=lambda t: t[0])
 
+                # --- Политика v4: календарь работы ---
+                dow = day_dt.weekday()  # Mon=0 ... Sun=6
+                if dow == 6:  # Sunday
+                    continue
+                if dow == 5 and emp_id != ALEX_ID:  # Saturday: только Alex
+                    continue
+
+                # Клиентские ограничения по дням недели (если заданы)
                 if body.preferred_days and weekday_code(day_dt) not in set(body.preferred_days):
                     continue
 
@@ -466,11 +518,11 @@ def suggest(body: SuggestIn):
                 )
                 suggestions.extend(cand)
 
-        # Ранжируем: риск (low < medium < high), затем ближайшее время
+        # Ранжирование: риск → время
         risk_order = {"low": 0, "medium": 1, "high": 2}
         suggestions.sort(key=lambda x: (risk_order.get(x.get("risk", "medium"), 1), x["slot_start"]))
 
-        # дедуп по (tech, slot_start)
+        # Дедуп по (tech, slot_start)
         seen = set()
         deduped = []
         for s in suggestions:
@@ -484,7 +536,7 @@ def suggest(body: SuggestIn):
             "address": body.address,
             "timezone": str(APP_TZ),
             "visit_minutes": visit_minutes,
-            "suggestions": deduped[:50]  # оставим побольше, компактный вывод сам сгруппирует
+            "suggestions": deduped[:50]
         }
 
     except Exception as e:
@@ -498,7 +550,6 @@ def suggest(body: SuggestIn):
 
 # ====== COMPACT TEXT OUTPUT ======
 def _fmt_hour(dt: datetime) -> str:
-    # "9am" / "12pm" / "1pm"
     hh = dt.hour
     suf = "am" if hh < 12 else "pm"
     base = hh if 1 <= hh <= 12 else (hh - 12 if hh > 12 else 12)
@@ -510,7 +561,6 @@ def _slot_human(start_iso: str, end_iso: str) -> str:
     return f"{_fmt_hour(s)}–{_fmt_hour(e)}"
 
 def format_compact(suggestions: List[dict]) -> str:
-    # Группировка: (tech, date_str) -> [ "12–3 (low)", ... ]
     grouped: Dict[Tuple[str, str], List[str]] = {}
     order_keys: List[Tuple[str, str]] = []
     for s in suggestions:
@@ -532,12 +582,10 @@ def format_compact(suggestions: List[dict]) -> str:
 
 @app.post("/suggest-compact")
 def suggest_compact(body: SuggestIn):
-    raw = suggest(body)  # используем логику /suggest
+    raw = suggest(body)
     if isinstance(raw, dict) and "suggestions" in raw:
         text = format_compact(raw["suggestions"])
-        return {
-            "address": raw["address"],
-            "timezone": raw["timezone"],
-            "summary": text
-        }
+        if not text.strip():
+            text = "Нет подходящих слотов в выбранный горизонт. Попробуйте увеличить days_ahead или ослабить ограничения."
+        return {"address": raw["address"], "timezone": raw["timezone"], "summary": text}
     return {"error": "failed"}
