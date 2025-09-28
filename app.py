@@ -27,7 +27,7 @@ HOME_MAP: Dict[str, str] = {
     # "pro_...": "City, ST"
 }
 
-# Бизнес-правила (политика v4)
+# Бизнес-правила (политика v4.1)
 VISIT_MINUTES_DEFAULT = 120
 DEFAULT_WORK_START = time(9, 0)
 DEFAULT_WORK_END   = time(18, 0)
@@ -41,12 +41,12 @@ GRID_STARTS = [9, 10, 11, 12, 13, 14, 15]  # 9–12,10–1,11–2,12–3,1–4,2
 ALEX_ID = "pro_5d48854aad6542a28f9da12d0c1b65f2"
 
 # ====== APP ======
-app = FastAPI(title="LocalPRO Scheduler Bridge (v4)")
+app = FastAPI(title="LocalPRO Scheduler Bridge (v4.1)")
 
 # ====== MODELS ======
 class SuggestIn(BaseModel):
     address: str
-    days_ahead: int = 3
+    days_ahead: int = 8
     preferred_days: Optional[List[str]] = None  # ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
     window_start: Optional[str] = None          # "12:00"
     window_end: Optional[str] = None            # "18:00"
@@ -290,7 +290,7 @@ def collect_arrival_windows(days_ahead: int) -> Dict[str, List[Tuple[datetime, d
     arrival_by_emp[employee_id] = список (win_start_local, win_end_local, job_address)
     """
     jobs_data = hcp_get("/jobs")
-    raw_jobs = jobs_data if isinstance(jobs_data, list) else jobs_data.get("results") or jobs_data.get("jobs") or []
+    raw_jobs = jobs_data if isinstance(raw_jobs := jobs_data, list) else jobs_data.get("results") or jobs_data.get("jobs") or []
     now_local = datetime.now(APP_TZ)
     horizon_end = now_local + timedelta(days=max(1, days_ahead))
 
@@ -324,9 +324,23 @@ def within_client_window(s: datetime, e: datetime, day_start: datetime, day_end:
 def overlaps(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
     return max(a_start, b_start) < min(a_end, b_end)
 
-def overlaps_any(s: datetime, e: datetime, windows: List[Tuple[datetime, datetime, str]]) -> bool:
-    for ws, we, _ in windows:
+def overlap_minutes(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> int:
+    start = max(a_start, b_start)
+    end = min(a_end, b_end)
+    if start >= end:
+        return 0
+    return int((end - start).total_seconds() // 60)
+
+def overlapping_windows(s: datetime, e: datetime, windows: List[Tuple[datetime, datetime, str]]) -> List[Tuple[datetime, datetime, str]]:
+    out = []
+    for ws, we, addr in windows:
         if overlaps(s, e, ws, we):
+            out.append((ws, we, addr))
+    return out
+
+def same_interval_exists(s: datetime, e: datetime, windows: List[Tuple[datetime, datetime, str]]) -> bool:
+    for ws, we, _ in windows:
+        if ws == s and we == e:
             return True
     return False
 
@@ -335,38 +349,40 @@ def allowed_step_overlap(prev: Optional[Tuple[datetime, datetime, str]],
                          new_s: datetime, new_e: datetime,
                          eta_prev_min: Optional[int]) -> bool:
     """
-    Разрешает перекрытия ТОЛЬКО “ступеньками” согласно v4.
-    - с prev: new.start == prev.start+1ч (и ETA ≤ 15) ИЛИ new.start == prev.start+2ч
-    - с next: допускаем пересечение только если next.start == new.start+2ч
-    Любые другие пересечения запрещены.
+    Разрешает ТОЛЬКО “ступени” согласно v4.1 и ограничивает длительность пересечений:
+    - с prev: (new.start == prev.start+1ч и ETA ≤15) ИЛИ (new.start == prev.start+2ч);
+      при этом overlap(prev,new) ≤ 120 минут.
+    - с next: если пересекается, то только при next.start == new.start+2ч и overlap(new,next) ≤ 60 минут.
+    - любые пересечения с не-соседними окнами запрещены (проверяется вне этой функции).
     """
-    ok_prev = True
-    ok_next = True
-
+    # Проверка с prev
     if prev:
         prev_s, prev_e, _ = prev
-        # базовые часы
         prev_start_hour = prev_s.hour
-        # требования:
-        # 1) смещённая ступень: new_s.hour == prev_start_hour + 1 И eta_prev ≤ 15
-        # 2) соседняя ступень: new_s.hour == prev_start_hour + 2
         cond_shifted = (new_s.hour == prev_start_hour + 1) and (eta_prev_min is not None and eta_prev_min <= VERY_CLOSE_THRESH)
         cond_base    = (new_s.hour == prev_start_hour + 2)
-        # если есть какое-то пересечение с prev, то оно допустимо только по одному из условий
-        if overlaps(new_s, new_e, prev_s, prev_e):
-            ok_prev = cond_shifted or cond_base
 
+        if overlaps(new_s, new_e, prev_s, prev_e):
+            if not (cond_shifted or cond_base):
+                return False
+            # ограничение длительности пересечения с prev
+            if overlap_minutes(new_s, new_e, prev_s, prev_e) > 120:
+                return False
+
+    # Проверка с next
     if nxt:
         nxt_s, nxt_e, _ = nxt
         nxt_start_hour = nxt_s.hour
-        # Допустимо пересекаться с next только если он начинается через 2 часа от new.start
-        cond_next = (nxt_start_hour == new_s.hour + 2)
         if overlaps(new_s, new_e, nxt_s, nxt_e):
-            ok_next = cond_next
+            if not (nxt_start_hour == new_s.hour + 2):
+                return False
+            # ограничение длительности пересечения с next
+            if overlap_minutes(new_s, new_e, nxt_s, nxt_e) > 60:
+                return False
 
-    return ok_prev and ok_next
+    return True
 
-# ====== BUILD CANDIDATES (POLICY v4 + real ETA) ======
+# ====== BUILD CANDIDATES (POLICY v4.1 + real ETA) ======
 def build_candidates_for_day(
     emp_id: str,
     dt_day: datetime,
@@ -388,7 +404,6 @@ def build_candidates_for_day(
             s, e = grid_slot(dt_day, h)
             if not within_client_window(s, e, day_start, day_end, win_start_str, win_end_str):
                 continue
-            # нет пересечений в пустой день, но оставим общий шаблон
             eta_from_home = eta_minutes(home_addr, new_addr) if home_addr else NORMAL_THRESH
             results.append({
                 "employee_id": emp_id,
@@ -426,11 +441,15 @@ def build_candidates_for_day(
             if not within_client_window(s, e, day_start, day_end, win_start_str, win_end_str):
                 continue
 
-            # Запрет «стартовать» ровно в тот же час, что уже занятый слот в этот день
+            # Запрет «стартовать» ровно в тот же час, что уже занятый слот (на всякий случай)
             if h in occupied_hours:
                 continue
 
-            # Предварительная проверка допустимости по “ступенькам” (политика v4)
+            # Запрет точного совпадения интервала с уже стоящим окном
+            if same_interval_exists(s, e, todays_windows):
+                continue
+
+            # Предварительная проверка допустимости по “ступенькам” (политика v4.1)
             eta_prev = None
             if prev:
                 eta_prev = eta_minutes(prev[2], new_addr)
@@ -439,15 +458,26 @@ def build_candidates_for_day(
                     continue
                 if not (h == base_after_prev or h == shifted_after_prev):
                     # из «блока после prev» разрешаем только соседнюю ступеньку или смещённую
-                    # (если prev отсутствует — ниже позволим базовую сетку)
                     continue
+            # если prev отсутствует — позволяем базовую сетку, но ниже проверим пересечения
 
-            # Если prev отсутствует (теоретически первый блок) — можно базовую сетку
-
-            # Если пересекается с чьим-то окном — разрешаем ТОЛЬКО если это “ступенька” по правилам
-            if overlaps_any(s, e, todays_windows):
+            # Если пересекается с чем-то — это должны быть только соседи, и по правилам
+            overlaps_list = overlapping_windows(s, e, todays_windows)
+            if overlaps_list:
+                # если пересекается не только с prev и/или next — запрещаем
+                allowed_refs = set()
+                if prev: allowed_refs.add((prev[0], prev[1], prev[2]))
+                if nxt:  allowed_refs.add((nxt[0], nxt[1], nxt[2]))
+                for ow in overlaps_list:
+                    if ow not in allowed_refs:
+                        # пересечение с не-соседом
+                        overlaps_list = None
+                        break
+                if overlaps_list is None:
+                    continue
+                # проверяем правила ступеней и длительности
                 if not allowed_step_overlap(prev, nxt, s, e, eta_prev):
-                    continue  # ЛЮБОЕ иное пересечение — запрещено
+                    continue
 
             # Оценка ETA к следующему/к дому для риска
             eta_next = eta_minutes(new_addr, nxt[2]) if nxt else (eta_minutes(new_addr, home_addr) if home_addr else None)
@@ -496,7 +526,7 @@ def suggest(body: SuggestIn):
                 day_key = day_dt.date().isoformat()
                 todays = sorted(buckets.get(day_key, []), key=lambda t: t[0])
 
-                # --- Политика v4: календарь работы ---
+                # --- Политика v4.1: календарь работы ---
                 dow = day_dt.weekday()  # Mon=0 ... Sun=6
                 if dow == 6:  # Sunday
                     continue
