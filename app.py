@@ -1,28 +1,18 @@
 # app.py
-# LocalPRO Scheduler Bridge — v4.5.0 (HCP Schedule OAuth + fallback to Jobs/Events Token)
+# LocalPRO Scheduler Bridge — v4.6.0 (Manual Blocks / No OAuth)
 import os
-from datetime import datetime, timedelta, time, date
+import uuid
+from datetime import datetime, timedelta, time
 from typing import Any, Optional, List, Tuple, Dict, Set
-from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Query, Path
+from pydantic import BaseModel, Field, validator
 import requests
 from requests.exceptions import RequestException, Timeout
 from zoneinfo import ZoneInfo
 
 # ====== CONFIG ======
 APP_TZ = ZoneInfo(os.environ.get("TZ", "America/New_York"))
-
-# --- HCP AUTH (two modes) ---
-# 1) OAuth (MAX/XL plan) — for /v1/schedule (Bearer)
-HCP_CLIENT_ID = os.environ.get("HCP_CLIENT_ID")
-HCP_CLIENT_SECRET = os.environ.get("HCP_CLIENT_SECRET")
-# Optional, if HCP uses audience; keep empty if not needed
-HCP_OAUTH_AUDIENCE = os.environ.get("HCP_OAUTH_AUDIENCE", "")
-OAUTH_TOKEN_URL = os.environ.get("HCP_OAUTH_TOKEN_URL", "https://api.housecallpro.com/oauth/token")
-
-# 2) Token (public API) — for /jobs and /events (Token)
 HCP_KEY = os.environ.get("HCP_API_KEY")
-
 HCP_BASE = os.environ.get("HCP_BASE", "https://api.housecallpro.com")
 GMAPS_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
 
@@ -37,6 +27,20 @@ HOME_MAP: Dict[str, str] = {
 }
 
 ALEX_ID = "pro_5d48854aad6542a28f9da12d0c1b65f2"  # Saturday only Alex
+
+def resolve_name(emp_id: Optional[str]) -> str:
+    if not emp_id:
+        return "Technician"
+    env_key = f"NAME_PRO_{emp_id}"
+    if env_key in os.environ and os.environ[env_key].strip():
+        return os.environ[env_key].strip()
+    return NAME_MAP.get(emp_id, "Technician")
+
+def resolve_home(emp_id: str) -> Optional[str]:
+    env_key = f"HOME_PRO_{emp_id}"
+    if env_key in os.environ and os.environ[env_key].strip():
+        return os.environ[env_key].strip()
+    return HOME_MAP.get(emp_id)
 
 # ====== BUSINESS RULES ======
 VISIT_MINUTES_DEFAULT = 120
@@ -55,7 +59,7 @@ FULL_WINDOW_MIN      = 180  # never
 MAX_OVERLAP_TOTAL_MIN = 60  # sum cap for job overlaps
 
 # ====== APP ======
-app = FastAPI(title="LocalPRO Scheduler Bridge (v4.5.0)")
+app = FastAPI(title="LocalPRO Scheduler Bridge (v4.6.0)")
 
 # ====== MODELS ======
 class SuggestIn(BaseModel):
@@ -74,7 +78,75 @@ class SuggestOut(BaseModel):
     visit_minutes: int
     suggestions: List[dict]
 
-# ====== SIMPLE UTILS ======
+# ==== Manual Blocks API ====
+class BlockIn(BaseModel):
+    employee_id: str = Field(..., description="pro_* id of technician")
+    start_local: str = Field(..., description="Local datetime ISO, e.g. 2025-09-29T09:00:00")
+    end_local: str = Field(..., description="Local datetime ISO, e.g. 2025-09-29T12:00:00")
+    title: str = Field("Blocked", description="Title/Reason")
+
+    @validator("employee_id")
+    def _emp_format(cls, v):
+        if not v.startswith("pro_"):
+            raise ValueError("employee_id must start with 'pro_'")
+        return v
+
+    @validator("end_local")
+    def _time_order(cls, v, values):
+        try:
+            s = values.get("start_local")
+            if s:
+                dt_s = datetime.fromisoformat(s)
+                dt_e = datetime.fromisoformat(v)
+                if dt_e <= dt_s:
+                    raise ValueError("end_local must be after start_local")
+        except Exception:
+            pass
+        return v
+
+class BlockOut(BlockIn):
+    id: str
+
+# In-memory store
+_BLOCKS: Dict[str, BlockOut] = {}
+
+# ====== HCP helpers (Token) ======
+def hcp_get(path: str, params=None):
+    if not HCP_KEY:
+        raise HTTPException(status_code=500, detail="HCP_API_KEY is not configured")
+    try:
+        r = requests.get(
+            f"{HCP_BASE}{path}",
+            headers={"Accept": "application/json", "Authorization": f"Token {HCP_KEY}"},
+            params=params or {},
+            timeout=15,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Timeout as e:
+        raise HTTPException(status_code=504, detail=f"HCP timeout on {path}") from e
+    except RequestException as e:
+        status = getattr(e.response, "status_code", 502)
+        raise HTTPException(status_code=status, detail=f"HCP error on {path}") from e
+
+def hcp_paged_list(path: str, max_pages: int = 12, per_page: int = 100) -> List[dict]:
+    items: List[dict] = []
+    for p in range(1, max_pages + 1):
+        data = hcp_get(path, params={"page": p, "per_page": per_page})
+        arr = data if isinstance(data, list) else data.get("results") or data.get("jobs") or data.get("events") or []
+        if not isinstance(arr, list):
+            break
+        items.extend(arr)
+        if len(arr) < per_page:
+            break
+    if not items:
+        data = hcp_get(path)
+        arr = data if isinstance(data, list) else data.get("results") or data.get("jobs") or data.get("events") or []
+        if isinstance(arr, list):
+            items = arr
+    return items
+
+# ====== UTIL ======
 def address_to_str(addr):
     if not isinstance(addr, dict):
         return str(addr)
@@ -87,10 +159,8 @@ def address_to_str(addr):
 
 def parse_iso_guess_tz(s: str) -> datetime:
     """
-    ISO-строка:
-    - если содержит смещение (Z/±HH:MM) — используем его;
-    - если без смещения — считаем ЛОКАЛЬНОЙ (APP_TZ).
-    Возвращаем в UTC.
+    If string has Z/±HH:MM -> use as-is. If naive -> treat as local (APP_TZ).
+    Return UTC.
     """
     if not isinstance(s, str):
         raise ValueError("Not a string")
@@ -102,7 +172,6 @@ def parse_iso_guess_tz(s: str) -> datetime:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=ZoneInfo("UTC"))
         return dt.astimezone(ZoneInfo("UTC"))
-    # naive => local
     dt_local = datetime.fromisoformat(s)
     if dt_local.tzinfo is None:
         dt_local = dt_local.replace(tzinfo=APP_TZ)
@@ -135,20 +204,6 @@ def _walk(obj: Any, path=""):
         yield (path, obj)
 
 # ====== NAME TOKENS & ALIASES ======
-def resolve_name(emp_id: Optional[str]) -> str:
-    if not emp_id:
-        return "Technician"
-    env_key = f"NAME_PRO_{emp_id}"
-    if env_key in os.environ and os.environ[env_key].strip():
-        return os.environ[env_key].strip()
-    return NAME_MAP.get(emp_id, "Technician")
-
-def resolve_home(emp_id: str) -> Optional[str]:
-    env_key = f"HOME_PRO_{emp_id}"
-    if env_key in os.environ and os.environ[env_key].strip():
-        return os.environ[env_key].strip()
-    return HOME_MAP.get(emp_id)
-
 def name_tokens_for_emp(emp_id: str) -> Set[str]:
     tokens: Set[str] = set()
     full = resolve_name(emp_id)
@@ -202,161 +257,7 @@ def _collect_emp_ids(obj: Any) -> Set[str]:
             ids |= _collect_emp_ids(it)
     return ids
 
-# ====== ETA ======
-def google_eta_minutes(src_addr: str, dst_addr: str) -> Optional[int]:
-    if not GMAPS_KEY:
-        return None
-    try:
-        resp = requests.get(
-            "https://maps.googleapis.com/maps/api/distancematrix/json",
-            params={"origins": src_addr, "destinations": dst_addr, "key": GMAPS_KEY, "units": "imperial"},
-            timeout=15
-        )
-        data = resp.json()
-        if data.get("status") != "OK":
-            return None
-        rows = data.get("rows", [])
-        if not rows or not rows[0].get("elements"):
-            return None
-        el = rows[0]["elements"][0]
-        if el.get("status") != "OK":
-            return None
-        seconds = el["duration"]["value"]
-        return int(round(seconds / 60))
-    except Exception:
-        return None
-
-NEAR_CITIES = {"st. augustine", "st augustine", "jacksonville", "orange park"}
-def estimate_eta_heuristic(src_addr: str, dst_addr: str) -> int:
-    def city(a: str) -> str:
-        try:
-            parts = [p.strip() for p in a.split(",")]
-            for i in range(len(parts)-1):
-                if len(parts[i+1]) == 2 and parts[i+1].isalpha():
-                    return parts[i].lower()
-            if len(parts) >= 3:
-                return parts[-3].lower()
-            if len(parts) >= 2:
-                return parts[1].lower()
-            return a.lower()
-        except Exception:
-            return a.lower()
-    a = city(src_addr or ""); b = city(dst_addr or "")
-    if not a or not b: return 30
-    if a == b: return 12
-    if a in NEAR_CITIES and b in NEAR_CITIES: return 22
-    return 45
-
-def eta_minutes(src_addr: str, dst_addr: str) -> int:
-    if not src_addr or not dst_addr:
-        return 30
-    real = google_eta_minutes(src_addr, dst_addr)
-    return real if real is not None else estimate_eta_heuristic(src_addr, dst_addr)
-
-def risk_label(eta: int) -> str:
-    if eta <= VERY_CLOSE_THRESH: return "low"
-    if eta <= NORMAL_THRESH:     return "medium"
-    return "high"
-
-# ====== HCP AUTH HELPERS (OAUTH) ======
-_oauth_cache: Dict[str, Any] = {"token": None, "exp": 0}
-
-def _oauth_now() -> int:
-    return int(datetime.utcnow().timestamp())
-
-def get_bearer_token() -> Optional[str]:
-    # return cached
-    if _oauth_cache["token"] and _oauth_cache["exp"] > _oauth_now() + 30:
-        return _oauth_cache["token"]
-    if not (HCP_CLIENT_ID and HCP_CLIENT_SECRET):
-        return None
-    try:
-        payload = {
-            "grant_type": "client_credentials",
-            "client_id": HCP_CLIENT_ID,
-            "client_secret": HCP_CLIENT_SECRET,
-        }
-        if HCP_OAUTH_AUDIENCE:
-            payload["audience"] = HCP_OAUTH_AUDIENCE
-        r = requests.post(OAUTH_TOKEN_URL, data=payload, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        token = data.get("access_token")
-        expires_in = int(data.get("expires_in", 900))
-        if token:
-            _oauth_cache["token"] = token
-            _oauth_cache["exp"] = _oauth_now() + max(60, expires_in - 30)
-            return token
-        return None
-    except Exception:
-        return None
-
-def hcp_get_token(path: str, params=None):
-    if not HCP_KEY:
-        raise HTTPException(status_code=500, detail="HCP_API_KEY is not configured")
-    try:
-        r = requests.get(
-            f"{HCP_BASE}{path}",
-            headers={"Accept": "application/json", "Authorization": f"Token {HCP_KEY}"},
-            params=params or {},
-            timeout=15,
-        )
-        r.raise_for_status()
-        return r.json()
-    except Timeout as e:
-        raise HTTPException(status_code=504, detail=f"HCP timeout on {path}") from e
-    except RequestException as e:
-        status = getattr(e.response, "status_code", 502)
-        raise HTTPException(status_code=status, detail=f"HCP error on {path}") from e
-
-def hcp_get_bearer(path: str, params=None):
-    token = get_bearer_token()
-    if not token:
-        raise HTTPException(status_code=500, detail="HCP OAuth token is not available")
-    try:
-        r = requests.get(
-            f"{HCP_BASE}{path}",
-            headers={"Accept": "application/json", "Authorization": f"Bearer {token}"},
-            params=params or {},
-            timeout=20,
-        )
-        if r.status_code == 401:
-            # refresh and retry once
-            _oauth_cache["token"] = None
-            token = get_bearer_token()
-            r = requests.get(
-                f"{HCP_BASE}{path}",
-                headers={"Accept": "application/json", "Authorization": f"Bearer {token}"},
-                params=params or {},
-                timeout=20,
-            )
-        r.raise_for_status()
-        return r.json()
-    except Timeout as e:
-        raise HTTPException(status_code=504, detail=f"HCP timeout on {path}") from e
-    except RequestException as e:
-        status = getattr(e.response, "status_code", 502)
-        raise HTTPException(status_code=status, detail=f"HCP error on {path}") from e
-
-# ====== HCP PAGINATION (Token) ======
-def hcp_paged_list_token(path: str, max_pages: int = 12, per_page: int = 100) -> List[dict]:
-    items: List[dict] = []
-    for p in range(1, max_pages + 1):
-        data = hcp_get_token(path, params={"page": p, "per_page": per_page})
-        arr = data if isinstance(data, list) else data.get("results") or data.get("jobs") or data.get("events") or []
-        if not isinstance(arr, list):
-            break
-        items.extend(arr)
-        if len(arr) < per_page:
-            break
-    if not items:
-        data = hcp_get_token(path)
-        arr = data if isinstance(data, list) else data.get("results") or data.get("jobs") or data.get("events") or []
-        if isinstance(arr, list):
-            items = arr
-    return items
-
-# ====== PICK TIME/TECH FROM JOB ======
+# ====== TIME & TECH FROM JOB ======
 def pick_time_and_tech(job: dict) -> Tuple[Optional[datetime], Optional[datetime], Optional[str], str]:
     start_utc = end_utc = None
     employee_id = None
@@ -391,7 +292,6 @@ def pick_time_and_tech(job: dict) -> Tuple[Optional[datetime], Optional[datetime
 
 # ====== EVENTS DETECTION ======
 EVENT_TYPE_KEYWORDS = {"event","block","blocked","calendar","personal","pto","vacation","meeting","busy","not available","unavailable","dispatch by name"}
-
 def looks_like_event_job(job: dict) -> bool:
     t1 = str(job.get("type") or "").lower()
     t2 = str(job.get("job_type") or "").lower()
@@ -437,101 +337,14 @@ def event_employee_id(ev: dict) -> Optional[str]:
     title = ev.get("title") or ev.get("summary") or ev.get("name") or ""
     return event_employee_id_from_title(title)
 
-# ====== SCHEDULE API (OAUTH) ======
-def try_fetch_schedule(day_start: date, day_end: date) -> Optional[List[dict]]:
-    """
-    GET /v1/schedule?start_date=YYYY-MM-DD&end_date=YYYY-MM-DD
-    Возвращает items с job/event/dispatch-by-name.
-    """
-    try:
-        params = {"start_date": day_start.isoformat(), "end_date": day_end.isoformat()}
-        data = hcp_get_bearer("/v1/schedule", params=params)
-        arr = data if isinstance(data, list) else data.get("results") or data.get("items") or []
-        if isinstance(arr, list):
-            return arr
-        return []
-    except Exception:
-        return None  # означает — используем фолбэк
-
-def schedule_item_to_window(it: dict) -> Optional[Tuple[datetime, datetime, Optional[str], str, bool]]:
-    """
-    Возвращает (start_local, end_local, employee_id, addr_or_title, is_event)
-    """
-    # 1) время
-    s_utc = e_utc = None
-    for k_start, k_end in [("start", "end"), ("scheduled_start", "scheduled_end"),
-                           ("starts_at", "ends_at"), ("start_time", "end_time")]:
-        s = it.get(k_start); e = it.get(k_end)
-        if isinstance(s, str) and isinstance(e, str):
-            try:
-                s_utc = parse_iso_guess_tz(s)
-                e_utc = parse_iso_guess_tz(e)
-                break
-            except Exception:
-                pass
-    if not (s_utc and e_utc):
-        return None
-
-    ws = to_local(s_utc); we = to_local(e_utc)
-
-    # 2) кто сотрудник
-    emp_ids = _collect_emp_ids(it)
-    emp_id = next(iter(emp_ids)) if emp_ids else None
-
-    # 3) адрес/заголовок
-    title = it.get("title") or it.get("summary") or it.get("name") or ""
-    addr = address_to_str(it.get("address") or it.get("service_address") or {}) or title or "Event"
-
-    # 4) тип
-    typ = str(it.get("type") or it.get("kind") or "").lower()
-    # признаки "dispatch by name" / busy
-    is_ev = False
-    if any(k in typ for k in EVENT_TYPE_KEYWORDS):
-        is_ev = True
-    else:
-        tt = (title or "").lower()
-        if any(k in tt for k in EVENT_TYPE_KEYWORDS):
-            is_ev = True
-        if not (it.get("address") or it.get("service_address")):
-            is_ev = True
-
-    # 5) маппинг dispatch-by-name: если emp_id нет, но в title есть имя техника — привязываем
-    if not emp_id:
-        for k in NAME_MAP.keys():
-            if title_mentions_emp(title, k):
-                emp_id = k
-                break
-
-    return (ws, we, emp_id, addr if not is_ev else (title or "Event"), is_ev)
-
 # ====== DEBUG ======
 @app.get("/health")
 def health():
-    return {
-        "status": "ok",
-        "tz": str(APP_TZ),
-        "gmaps": bool(GMAPS_KEY),
-        "oauth": bool(HCP_CLIENT_ID and HCP_CLIENT_SECRET),
-        "token": bool(HCP_KEY),
-        "version": "v4.5.0"
-    }
-
-@app.get("/debug/hcp-schedule")
-def debug_hcp_schedule(
-    start: str = Query(..., description="YYYY-MM-DD"),
-    end: str = Query(..., description="YYYY-MM-DD (inclusive)")
-):
-    try:
-        d1 = datetime.fromisoformat(start).date()
-        d2 = datetime.fromisoformat(end).date()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Bad date format, expected YYYY-MM-DD")
-    raw = try_fetch_schedule(d1, d2)
-    return {"range": [start, end], "count": len(raw or []), "items_preview": (raw or [])[:20]}
+    return {"status": "ok", "tz": str(APP_TZ), "gmaps": bool(GMAPS_KEY), "token": bool(HCP_KEY), "version": "v4.6.0"}
 
 @app.get("/debug/hcp-jobs-compact")
 def debug_hcp_jobs_compact():
-    data = hcp_paged_list_token("/jobs") if HCP_KEY else []
+    data = hcp_paged_list("/jobs") if HCP_KEY else []
     out = []
     for item in (data[:20] if isinstance(data, list) else []):
         s_utc, e_utc, emp_id, addr_str = pick_time_and_tech(item)
@@ -546,10 +359,10 @@ def debug_hcp_jobs_compact():
     return {"count_preview": len(out), "jobs": out}
 
 @app.get("/debug/day")
-def debug_day(date_str: str = Query(..., description="YYYY-MM-DD")):
+def debug_day(date: str = Query(..., description="YYYY-MM-DD")):
     arrival_by_emp = collect_arrival_windows(days_ahead=30)
     try:
-        target = datetime.fromisoformat(date_str).date()
+        target = datetime.fromisoformat(date).date()
     except Exception:
         raise HTTPException(status_code=400, detail="Bad date format, expected YYYY-MM-DD")
     report: Dict[str, List[dict]] = {}
@@ -565,99 +378,109 @@ def debug_day(date_str: str = Query(..., description="YYYY-MM-DD")):
                 })
         if lines:
             report[resolve_name(emp_id)] = lines
-    return {"date": date_str, "seen": report}
+    return {"date": date, "seen": report}
 
-@app.get("/debug/events-orphaned")
-def debug_events_orphaned():
-    orphaned = []
-    # Смотрим только fallback /events (Token), если доступен
-    events = []
+# ====== MANUAL BLOCKS ENDPOINTS ======
+@app.get("/blocks", response_model=List[BlockOut])
+def list_blocks():
+    return list(_BLOCKS.values())
+
+@app.post("/blocks", response_model=BlockOut)
+def create_block(block: BlockIn):
     try:
-        events = hcp_paged_list_token("/events") if HCP_KEY else []
-    except Exception:
-        events = []
-    for ev in events:
-        s_utc, e_utc = parse_event_time(ev)
-        if not (s_utc and e_utc):
-            continue
-        emp = event_employee_id(ev)
-        if not emp:
-            orphaned.append({
-                "title": ev.get("title") or ev.get("summary") or ev.get("name"),
-                "start_utc": s_utc.isoformat(), "end_utc": e_utc.isoformat(),
-                "raw": {"assigned_employees": ev.get("assigned_employees")}
-            })
-    return {"orphaned_count": len(orphaned), "items": orphaned[:50]}
+        # Parse local times, store as local ISO (tz-aware)
+        s = datetime.fromisoformat(block.start_local)
+        e = datetime.fromisoformat(block.end_local)
+        if s.tzinfo is None: s = s.replace(tzinfo=APP_TZ)
+        if e.tzinfo is None: e = e.replace(tzinfo=APP_TZ)
+        if e <= s:
+            raise HTTPException(status_code=400, detail="end_local must be after start_local")
+        bid = str(uuid.uuid4())
+        out = BlockOut(id=bid,
+                       employee_id=block.employee_id,
+                       start_local=s.isoformat(),
+                       end_local=e.isoformat(),
+                       title=block.title or "Blocked")
+        _BLOCKS[bid] = out
+        return out
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Bad datetime format; use ISO like 2025-09-29T09:00:00")
+
+@app.delete("/blocks/{block_id}")
+def delete_block(block_id: str = Path(...)):
+    if block_id in _BLOCKS:
+        del _BLOCKS[block_id]
+        return {"deleted": block_id}
+    raise HTTPException(status_code=404, detail="Not found")
 
 # ====== WINDOW TYPE ======
 Window = Tuple[datetime, datetime, str, bool]  # (start_local, end_local, address/title, is_event)
 
 # ====== COLLECT ARRIVAL WINDOWS ======
+def try_collect_events_paged() -> List[dict]:
+    try:
+        return hcp_paged_list("/events")
+    except Exception:
+        return []
+
+def _iter_manual_blocks(now_local: datetime, horizon_end: datetime):
+    for b in _BLOCKS.values():
+        try:
+            s = datetime.fromisoformat(b.start_local)
+            e = datetime.fromisoformat(b.end_local)
+            if s.tzinfo is None: s = s.replace(tzinfo=APP_TZ)
+            if e.tzinfo is None: e = e.replace(tzinfo=APP_TZ)
+        except Exception:
+            continue
+        if e < now_local or s > horizon_end:
+            continue
+        yield b.employee_id, s, e, (b.title or "Blocked")
+
 def collect_arrival_windows(days_ahead: int) -> Dict[str, List[Window]]:
     now_local = datetime.now(APP_TZ)
     horizon_end = now_local + timedelta(days=max(1, days_ahead))
     arrival_by_emp: Dict[str, List[Window]] = {}
 
-    # 1) PRIMARY: SCHEDULE (OAuth)
-    d1 = now_local.date()
-    d2 = horizon_end.date()
-    schedule_items = try_fetch_schedule(d1, d2)  # None => fallback
-    if schedule_items is not None:
-        # соберём по техникам
-        for it in schedule_items:
-            mapped = schedule_item_to_window(it)
-            if not mapped:
-                continue
-            ws, we, emp_id, addr_or_title, is_event = mapped
-            if we < now_local or ws > horizon_end:
-                continue
-            # если emp_id так и не нашли — считаем глобальным блоком (редко, но бывает)
-            if not emp_id:
-                # глобально на всех известных техников
-                for all_emp in NAME_MAP.keys():
-                    arrival_by_emp.setdefault(all_emp, []).append((ws, we, addr_or_title, True))
-            else:
-                arrival_by_emp.setdefault(emp_id, []).append((ws, we, addr_or_title, is_event))
-    else:
-        # 2) FALLBACK: JOBS + EVENTS (Token)
-        jobs = hcp_paged_list_token("/jobs") if HCP_KEY else []
-        for j in jobs if isinstance(jobs, list) else []:
-            start_utc, end_utc, emp_id, addr_str = pick_time_and_tech(j)
-            if not (start_utc and end_utc):
-                continue
-            ws = to_local(start_utc); we = to_local(end_utc)
-            if we < now_local or ws > horizon_end:
-                continue
-            # Try to infer employee from title if missing
-            if not emp_id:
-                title = j.get("title") or j.get("summary") or j.get("name") or ""
-                emp_id = event_employee_id_from_title(title)
-            is_event_job = looks_like_event_job(j)
-            if emp_id:
-                arrival_by_emp.setdefault(emp_id, []).append(
-                    (ws, we, addr_str if not is_event_job else (j.get("title") or j.get("summary") or "Event"), is_event_job)
-                )
-        events = []
-        try:
-            events = hcp_paged_list_token("/events") if HCP_KEY else []
-        except Exception:
-            events = []
-        for ev in events:
-            s_utc, e_utc = parse_event_time(ev)
-            emp_id = event_employee_id(ev)
-            if not (s_utc and e_utc):
-                continue
-            ws = to_local(s_utc); we = to_local(e_utc)
-            if we < now_local or ws > horizon_end:
-                continue
-            addr_str = address_to_str(ev.get("address") or {}) or (ev.get("title") or ev.get("summary") or "Event")
-            if emp_id:
-                arrival_by_emp.setdefault(emp_id, []).append((ws, we, addr_str, True))
-            else:
-                for all_emp in NAME_MAP.keys():
-                    arrival_by_emp.setdefault(all_emp, []).append((ws, we, addr_str, True))
+    # Jobs
+    jobs = hcp_paged_list("/jobs") if HCP_KEY else []
+    for j in jobs if isinstance(jobs, list) else []:
+        start_utc, end_utc, emp_id, addr_str = pick_time_and_tech(j)
+        if not (start_utc and end_utc):
+            continue
+        ws = to_local(start_utc); we = to_local(end_utc)
+        if we < now_local or ws > horizon_end:
+            continue
+        if not emp_id:
+            title = j.get("title") or j.get("summary") or j.get("name") or ""
+            emp_id = event_employee_id_from_title(title)
+        is_event_job = looks_like_event_job(j)
+        if emp_id:
+            arrival_by_emp.setdefault(emp_id, []).append(
+                (ws, we, addr_str if not is_event_job else (j.get("title") or j.get("summary") or "Event"), is_event_job)
+            )
 
-    # normalize & sort
+    # Events (if visible in Token API)
+    events = try_collect_events_paged() if HCP_KEY else []
+    for ev in events:
+        s_utc, e_utc = parse_event_time(ev)
+        emp_id = event_employee_id(ev)
+        if not (s_utc and e_utc):
+            continue
+        ws = to_local(s_utc); we = to_local(e_utc)
+        if we < now_local or ws > horizon_end:
+            continue
+        addr_str = address_to_str(ev.get("address") or {}) or (ev.get("title") or ev.get("summary") or "Event")
+        if emp_id:
+            arrival_by_emp.setdefault(emp_id, []).append((ws, we, addr_str, True))
+        else:
+            for all_emp in NAME_MAP.keys():
+                arrival_by_emp.setdefault(all_emp, []).append((ws, we, addr_str, True))
+
+    # Manual Blocks — always as hard events
+    for emp_id, s, e, title in _iter_manual_blocks(now_local, horizon_end):
+        arrival_by_emp.setdefault(emp_id, []).append((s, e, title, True))
+
+    # Normalize & sort
     for emp_id in arrival_by_emp:
         arrival_by_emp[emp_id].sort(key=lambda t: t[0])
     return arrival_by_emp
@@ -707,7 +530,7 @@ def build_candidates_for_day(
     occupied_start_hours = set(ws.hour for ws, _, _, _ in todays_windows)  # safety: no same-hour start
     results: List[dict] = []
 
-    # Пустой день
+    # Empty day
     if not todays_windows:
         for h in GRID_STARTS:
             s, e = grid_slot(dt_day, h)
@@ -749,7 +572,7 @@ def build_candidates_for_day(
             if same_interval_exists(s, e, todays_windows):
                 continue
 
-            # Первый визит дня не может перекрывать НИ одно окно
+            # First slot of day cannot overlap any window
             if prev is None and overlapping_windows(s, e, todays_windows):
                 continue
 
@@ -764,11 +587,11 @@ def build_candidates_for_day(
 
             overlaps_list = overlapping_windows(s, e, todays_windows)
             if overlaps_list:
-                # Полный запрет пересечений с евентами
+                # No overlap with events (manual blocks & events)
                 if any(ow[3] for ow in overlaps_list):
                     continue
 
-                # Разрешаем перекрытие только с одним окном (prev ИЛИ next), суммарно ≤ 60 минут
+                # Only overlap with exactly ONE neighbor (prev OR next), sum ≤ 60
                 allowed_refs = set()
                 if prev: allowed_refs.add((prev[0], prev[1], prev[2], prev[3]))
                 if nxt:  allowed_refs.add((nxt[0], nxt[1], nxt[2], nxt[3]))
