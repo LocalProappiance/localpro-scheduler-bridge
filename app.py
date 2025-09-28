@@ -70,3 +70,26 @@ def suggest(body: SuggestIn):
         "timezone": APP_TZ,
         "suggestions": placeholder_suggestions(body.address, body.days_ahead)
     }
+    # === DEBUG ROUTES TO CONFIRM HCP ACCESS FROM THE SERVER ===
+
+@app.get("/debug/hcp-company")
+def debug_hcp_company():
+    """Quick check: read company info from Housecall Pro."""
+    data = hcp_get("/company")
+    # Вернём только безопасный минимум
+    return {"name": data.get("name", "unknown"), "ok": True}
+
+@app.get("/debug/hcp-jobs")
+def debug_hcp_jobs():
+    """List first 5 jobs (id + address) to confirm we can read jobs."""
+    data = hcp_get("/jobs")
+    jobs = []
+    # На всякий случай: разные аккаунты могут возвращать список в разных ключах
+    raw = data if isinstance(data, list) else data.get("results") or data.get("jobs") or []
+    for item in (raw[:5] if isinstance(raw, list) else []):
+        jobs.append({
+            "id": item.get("id"),
+            "address": item.get("address") or item.get("full_address") or item.get("location")
+        })
+    return {"count_preview": len(jobs), "jobs": jobs}
+
