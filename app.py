@@ -14,7 +14,6 @@ HCP_BASE = "https://api.housecallpro.com"
 
 # Бизнес-правила LocalPRO
 VISIT_MINUTES_DEFAULT = 120   # длительность визита: 2 часа
-DRIVE_BUFFER_MINUTES  = 20    # буфер на дорогу (на этапе маршрутов)
 DEFAULT_WORK_START = time(8, 0)   # 08:00
 DEFAULT_WORK_END   = time(18, 0)  # 18:00
 
@@ -40,7 +39,7 @@ def hcp_get(path: str, params=None):
             f"{HCP_BASE}{path}",
             headers={"Accept": "application/json", "Authorization": f"Token {HCP_KEY}"},
             params=params or {},
-            timeout=15,  # делаем короче, чтобы не вылетать в 502 по таймауту
+            timeout=15,
         )
         r.raise_for_status()
         return r.json()
@@ -78,7 +77,6 @@ def from_local(naive_date: datetime, hhmm: Optional[str]) -> Optional[datetime]:
     if not hhmm:
         return None
     h, m = [int(x) for x in hhmm.split(":")]
-    # гарантируем tz-aware
     if naive_date.tzinfo is None:
         naive_date = naive_date.replace(tzinfo=APP_TZ)
     return naive_date.replace(hour=h, minute=m, second=0, microsecond=0)
@@ -144,33 +142,6 @@ def debug_hcp_company():
     data = hcp_get("/company")
     return {"name": data.get("name", "unknown"), "ok": True}
 
-@app.get("/debug/hcp-jobs")
-def debug_hcp_jobs():
-    data = hcp_get("/jobs")
-    jobs = []
-    raw = data if isinstance(data, list) else data.get("results") or data.get("jobs") or []
-    for item in (raw[:5] if isinstance(raw, list) else []):
-        jobs.append({
-            "id": item.get("id"),
-            "address": item.get("address") or item.get("full_address") or item.get("location")
-        })
-    return {"count_preview": len(jobs), "jobs": jobs}
-
-@app.get("/debug/hcp-one-raw")
-def debug_hcp_one_raw():
-    data = hcp_get("/jobs")
-    raw = data if isinstance(data, list) else data.get("results") or data.get("jobs") or []
-    if not isinstance(raw, list) or not raw:
-        return {"ok": True, "job": None}
-    item = raw[0]
-    keep_keys = [
-        "id","address","service_address","schedule",
-        "assigned_employees","assigned_to","technician","user",
-        "status","title","type"
-    ]
-    trimmed = {k: item.get(k) for k in keep_keys if k in item}
-    return {"ok": True, "job": trimmed}
-
 @app.get("/debug/hcp-jobs-compact")
 def debug_hcp_jobs_compact():
     data = hcp_get("/jobs")
@@ -187,33 +158,13 @@ def debug_hcp_jobs_compact():
         })
     return {"count_preview": len(out), "jobs": out}
 
-@app.get("/debug/hcp-users")
-def debug_hcp_users():
-    data = hcp_get("/users")
-    raw = data if isinstance(data, list) else data.get("results") or data.get("users") or []
-    out = []
-    for u in (raw[:10] if isinstance(raw, list) else []):
-        out.append({
-            "id": u.get("id"),
-            "name": u.get("name") or u.get("full_name") or u.get("first_name"),
-            "email": u.get("email"),
-            "role": u.get("role") or u.get("type")
-        })
-    return {"count_preview": len(out), "users": out}
-
 # ====== CORE SCHEDULING (без расстояний) ======
-def collect_busy_windows(days_ahead: int) -> Tuple[Dict[str, List[Tuple[datetime, datetime, str]]], Dict[str, str]]:
+def collect_busy_windows(days_ahead: int) -> Dict[str, List[Tuple[datetime, datetime, str]]]:
+    """
+    Возвращает busy_by_emp[employee_id] = список (start_local, end_local, job_address)
+    """
     jobs_data = hcp_get("/jobs")
     raw_jobs = jobs_data if isinstance(jobs_data, list) else jobs_data.get("results") or jobs_data.get("jobs") or []
-
-    users_data = hcp_get("/users")
-    raw_users = users_data if isinstance(users_data, list) else users_data.get("results") or users_data.get("users") or []
-    name_by_emp: Dict[str, str] = {}
-    for u in (raw_users if isinstance(raw_users, list) else []):
-        uid = u.get("id")
-        nm = u.get("name") or u.get("full_name") or u.get("first_name")
-        if uid:
-            name_by_emp[uid] = nm or "Technician"
 
     now_local = datetime.now(APP_TZ)
     horizon_end = now_local + timedelta(days=max(1, days_ahead))
@@ -232,11 +183,10 @@ def collect_busy_windows(days_ahead: int) -> Tuple[Dict[str, List[Tuple[datetime
     for emp_id in busy_by_emp:
         busy_by_emp[emp_id].sort(key=lambda t: t[0])
 
-    return busy_by_emp, name_by_emp
+    return busy_by_emp
 
 def generate_free_slots(
     busy_by_emp: Dict[str, List[Tuple[datetime, datetime, str]]],
-    name_by_emp: Dict[str, str],
     days_ahead: int,
     preferred_days: Optional[List[str]],
     window_start_str: Optional[str],
@@ -278,7 +228,7 @@ def generate_free_slots(
                 if (gap_end - gap_start).total_seconds() >= visit_minutes * 60:
                     results.append({
                         "employee_id": emp_id,
-                        "tech_name": name_by_emp.get(emp_id) or "Technician",
+                        "tech_name": "Technician",  # имя недоступно без /users — позже можно сделать словарь
                         "slot_start": gap_start.isoformat(),
                         "slot_end": (gap_start + timedelta(minutes=visit_minutes)).isoformat(),
                         "window_end": gap_end.isoformat(),
@@ -294,7 +244,7 @@ def generate_free_slots(
 def suggest(body: SuggestIn):
     try:
         visit_minutes = body.visit_minutes or VISIT_MINUTES_DEFAULT
-        busy_by_emp, name_by_emp = collect_busy_windows(days_ahead=body.days_ahead)
+        busy_by_emp = collect_busy_windows(days_ahead=body.days_ahead)
 
         if not busy_by_emp:
             return {
@@ -306,7 +256,6 @@ def suggest(body: SuggestIn):
 
         slots = generate_free_slots(
             busy_by_emp=busy_by_emp,
-            name_by_emp=name_by_emp,
             days_ahead=body.days_ahead,
             preferred_days=body.preferred_days,
             window_start_str=body.window_start,
@@ -320,9 +269,4 @@ def suggest(body: SuggestIn):
             "suggestions": slots
         }
     except Exception as e:
-        # Вместо 502 вернём понятное сообщение
-        return {
-            "address": body.address,
-            "timezone": str(APP_TZ),
-            "error": str(e)
-        }
+        return {"address": body.address, "timezone": str(APP_TZ), "error": str(e)}
