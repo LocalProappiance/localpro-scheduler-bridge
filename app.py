@@ -92,4 +92,83 @@ def debug_hcp_jobs():
             "address": item.get("address") or item.get("full_address") or item.get("location")
         })
     return {"count_preview": len(jobs), "jobs": jobs}
+    # === HELPERS ===
+def address_to_str(addr):
+    if not isinstance(addr, dict):
+        return str(addr)
+    parts = []
+    for k in ["street", "street_line_2", "city", "state", "zip", "country"]:
+        v = addr.get(k)
+        if v:
+            parts.append(str(v))
+    return ", ".join(parts)
+
+def pick_time(job):
+    """
+    Под разные аккаунты HCP время может лежать в разных ключах.
+    Попробуем по очереди, вернём что найдём.
+    """
+    # варианты: scheduled_start/End, start/End, window_start/End
+    candidates = [
+        ("scheduled_start", "scheduled_end"),
+        ("start", "end"),
+        ("window_start", "window_end"),
+        ("start_time", "end_time")
+    ]
+    for s_key, e_key in candidates:
+        s = job.get(s_key)
+        e = job.get(e_key)
+        if s or e:
+            return s, e
+    return None, None
+
+def pick_tech(job):
+    """
+    Аналогично для техника: могут быть assigned_to, technician, user или массив assignees.
+    """
+    for key in ["assigned_to", "technician", "user", "assignees"]:
+        if key in job:
+            return job.get(key)
+    return None
+
+# === NEW DEBUG ROUTES ===
+
+@app.get("/debug/hcp-jobs-compact")
+def debug_hcp_jobs_compact():
+    """
+    Вернём 5 заявок: id, полный адрес строкой, время (если есть), и кого видим назначенным.
+    """
+    data = hcp_get("/jobs")
+    raw = data if isinstance(data, list) else data.get("results") or data.get("jobs") or []
+    out = []
+    for item in (raw[:5] if isinstance(raw, list) else []):
+        addr_str = address_to_str(item.get("address") or item.get("service_address") or {})
+        start, end = pick_time(item)
+        tech = pick_tech(item)
+        out.append({
+            "id": item.get("id"),
+            "address": addr_str,
+            "start": start,
+            "end": end,
+            "assigned": tech
+        })
+    return {"count_preview": len(out), "jobs": out}
+
+@app.get("/debug/hcp-one-raw")
+def debug_hcp_one_raw():
+    """
+    Вернём урезанный «сырой» объект первой заявки (без секретов), чтобы увидеть точные ключи.
+    """
+    data = hcp_get("/jobs")
+    raw = data if isinstance(data, list) else data.get("results") or data.get("jobs") or []
+    if not isinstance(raw, list) or not raw:
+        return {"ok": True, "job": None}
+    item = raw[0]
+    # Урезаем до полезных ключей верхнего уровня (без вложенных больших списков)
+    keep_keys = ["id","address","service_address","assigned_to","technician","user",
+                 "assignees","scheduled_start","scheduled_end","start","end",
+                 "window_start","window_end","start_time","end_time","status","title","type"]
+    trimmed = {k: item.get(k) for k in keep_keys if k in item}
+    return {"ok": True, "job": trimmed}
+
 
