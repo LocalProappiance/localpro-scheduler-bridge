@@ -1,8 +1,13 @@
 # app.py
-# LocalPRO Scheduler Bridge (v4.3.3 + fix: parse schedule.start_time/end_time for /events)
+# LocalPRO Scheduler Bridge
+# v4.3.3 + fixes:
+# - /events: support schedule.start_time/end_time
+# - /jobs: support arrival_window_* & appointment_window_* fields
+# - stricter overlap rules: events are hard blocks; jobs step overlaps <= 60 min
+
 import os
 from datetime import datetime, timedelta, time
-from typing import Any, Optional, List, Tuple, Dict
+from typing import Any, Optional, List, Tuple, Dict, Set
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 import requests
@@ -23,7 +28,11 @@ NAME_MAP: Dict[str, str] = {
 }
 HOME_MAP: Dict[str, str] = {}
 
-def resolve_name(emp_id: str) -> str:
+ALEX_ID = "pro_5d48854aad6542a28f9da12d0c1b65f2"  # Saturday only Alex
+
+def resolve_name(emp_id: Optional[str]) -> str:
+    if not emp_id:
+        return "Technician"
     env_key = f"NAME_PRO_{emp_id}"
     if env_key in os.environ and os.environ[env_key].strip():
         return os.environ[env_key].strip()
@@ -35,7 +44,7 @@ def resolve_home(emp_id: str) -> Optional[str]:
         return os.environ[env_key].strip()
     return HOME_MAP.get(emp_id)
 
-# ====== BUSINESS RULES (v4.3.3) ======
+# ====== BUSINESS RULES ======
 VISIT_MINUTES_DEFAULT = 120
 DEFAULT_WORK_START = time(9, 0)
 DEFAULT_WORK_END   = time(18, 0)
@@ -44,10 +53,14 @@ VERY_CLOSE_THRESH = 15   # ≤15 → low
 NORMAL_THRESH     = 40   # 16..40 → medium; >40 → high
 
 GRID_STARTS = [9, 10, 11, 12, 13, 14, 15]  # 3-часовые окна: 9–12..3–6
-ALEX_ID = "pro_5d48854aad6542a28f9da12d0c1b65f2"  # Суббота — только Alex
+
+# Overlap caps
+MAX_OVERLAP_PREV_MIN = 60
+MAX_OVERLAP_NEXT_MIN = 60
+FULL_WINDOW_MIN      = 180  # 3 часа — категорически нельзя
 
 # ====== APP ======
-app = FastAPI(title="LocalPRO Scheduler Bridge (v4.3.3+events-schedule-fix)")
+app = FastAPI(title="LocalPRO Scheduler Bridge (v4.3.3+events+arrival-window)")
 
 # ====== MODELS ======
 class SuggestIn(BaseModel):
@@ -75,7 +88,7 @@ def hcp_get(path: str, params=None):
             f"{HCP_BASE}{path}",
             headers={"Accept": "application/json", "Authorization": f"Token {HCP_KEY}"},
             params=params or {},
-            timeout=15,
+            timeout=20,
         )
         r.raise_for_status()
         return r.json()
@@ -103,18 +116,6 @@ def hcp_paged_list(path: str, max_pages: int = 12, per_page: int = 100) -> List[
     return items
 
 # ====== UTIL ======
-def safe_city(addr_str: str) -> str:
-    try:
-        parts = [p.strip() for p in addr_str.split(",")]
-        for i in range(len(parts)-1):
-            if len(parts[i+1]) == 2 and parts[i+1].isalpha():
-                return parts[i]
-        if len(parts) >= 2:
-            return parts[-3] if len(parts) >= 3 else parts[1]
-        return addr_str
-    except Exception:
-        return addr_str
-
 def address_to_str(addr):
     if not isinstance(addr, dict):
         return str(addr)
@@ -128,6 +129,7 @@ def address_to_str(addr):
 def parse_iso_utc(s: str) -> datetime:
     if not isinstance(s, str):
         raise ValueError("Not a string")
+    # HCP возвращает ISO и с "Z", и без TZ. Считаем без TZ как UTC (HCP events дают Z).
     if s.endswith("Z"):
         s = s.replace("Z", "+00:00")
     dt = datetime.fromisoformat(s)
@@ -161,123 +163,28 @@ def _walk(obj: Any, path=""):
     else:
         yield (path, obj)
 
-def pick_time_and_tech(job: dict) -> Tuple[Optional[datetime], Optional[datetime], Optional[str], str]:
-    start_utc = end_utc = None
-    employee_id = None
+# ====== NAME TOKENS ======
+def name_tokens_for_emp(emp_id: str) -> Set[str]:
+    tokens: Set[str] = set()
+    full = resolve_name(emp_id)
+    for t in full.replace("-", " ").split():
+        t = t.strip()
+        if len(t) >= 2:
+            tokens.add(t.lower())
+    alias_key = f"ALIAS_PRO_{emp_id}"
+    if alias_key in os.environ and os.environ[alias_key].strip():
+        for t in os.environ[alias_key].replace(",", " ").split():
+            t = t.strip()
+            if len(t) >= 2:
+                tokens.add(t.lower())
+    return tokens
 
-    schedule = job.get("schedule") or {}
-    s = schedule.get("scheduled_start") or job.get("scheduled_start") or job.get("start") or job.get("starts_at") or job.get("start_time")
-    e = schedule.get("scheduled_end")   or job.get("scheduled_end")   or job.get("end")   or job.get("ends_at")   or job.get("end_time")
-    if isinstance(s, str):
-        try: start_utc = parse_iso_utc(s)
-        except Exception: start_utc = None
-    if isinstance(e, str):
-        try: end_utc = parse_iso_utc(e)
-        except Exception: end_utc = None
-
-    assigned_employees = job.get("assigned_employees")
-    if isinstance(assigned_employees, list) and assigned_employees:
-        first = assigned_employees[0]
-        if isinstance(first, dict):
-            employee_id = first.get("id")
-
-    addr_str = address_to_str(job.get("address") or job.get("service_address") or {})
-
-# --- HCP Public API: arrival window полями job ---
-if not (start_utc and end_utc):
-    aws = (
-        job.get("arrival_window_start") or
-        job.get("appointment_window_start") or
-        (job.get("arrival_window") or {}).get("start") or
-        (job.get("arrival_window") or {}).get("start_time")
-    )
-    awe = (
-        job.get("arrival_window_end") or
-        job.get("appointment_window_end") or
-        (job.get("arrival_window") or {}).get("end") or
-        (job.get("arrival_window") or {}).get("end_time")
-    )
-    if isinstance(aws, str) and isinstance(awe, str):
-        try:
-            start_utc = parse_iso_utc(aws)
-            end_utc   = parse_iso_utc(awe)
-        except Exception:
-            pass
-
-# универсальный обход — оставь как у тебя
-if not (start_utc and end_utc):
-    for p, v in _walk(job):
-        low = p.lower()
-        if isinstance(v, str) and not start_utc and ("arrival_window_start" in low or ("start" in low and any(ch.isdigit() for ch in v))):
-            try: start_utc = parse_iso_utc(v)
-            except Exception: pass
-        if isinstance(v, str) and not end_utc and ("arrival_window_end" in low or ("end" in low and any(ch.isdigit() for ch in v))):
-            try: end_utc = parse_iso_utc(v)
-            except Exception: pass
-
-return start_utc, end_utc, employee_id, addr_str
-
-# ====== ETA ======
-def google_eta_minutes(src_addr: str, dst_addr: str) -> Optional[int]:
-    if not GMAPS_KEY:
-        return None
-    try:
-        resp = requests.get(
-            "https://maps.googleapis.com/maps/api/distancematrix/json",
-            params={"origins": src_addr, "destinations": dst_addr, "key": GMAPS_KEY, "units": "imperial"},
-            timeout=15
-        )
-        data = resp.json()
-        if data.get("status") != "OK":
-            return None
-        rows = data.get("rows", [])
-        if not rows or not rows[0].get("elements"):
-            return None
-        el = rows[0]["elements"][0]
-        if el.get("status") != "OK":
-            return None
-        seconds = el["duration"]["value"]
-        return int(round(seconds / 60))
-    except Exception:
-        return None
-
-NEAR_CITIES = {"st. augustine", "st augustine", "jacksonville", "orange park"}
-def estimate_eta_heuristic(src_addr: str, dst_addr: str) -> int:
-    def city(a: str) -> str:
-        try:
-            parts = [p.strip() for p in a.split(",")]
-            for i in range(len(parts)-1):
-                if len(parts[i+1]) == 2 and parts[i+1].isalpha():
-                    return parts[i].lower()
-            if len(parts) >= 3:
-                return parts[-3].lower()
-            if len(parts) >= 2:
-                return parts[1].lower()
-            return a.lower()
-        except Exception:
-            return a.lower()
-    a = city(src_addr or "")
-    b = city(dst_addr or "")
-    if not a or not b:
-        return 30
-    if a == b:
-        return 12
-    if a in NEAR_CITIES and b in NEAR_CITIES:
-        return 22
-    return 45
-
-def eta_minutes(src_addr: str, dst_addr: str) -> int:
-    if not src_addr or not dst_addr:
-        return 30
-    real = google_eta_minutes(src_addr, dst_addr)
-    return real if real is not None else estimate_eta_heuristic(src_addr, dst_addr)
-
-def risk_label(eta: int) -> str:
-    if eta <= VERY_CLOSE_THRESH:
-        return "low"
-    if eta <= NORMAL_THRESH:
-        return "medium"
-    return "high"
+def title_mentions_emp(title: str, emp_id: str) -> bool:
+    low = (title or "").lower()
+    for tok in name_tokens_for_emp(emp_id):
+        if tok and tok in low:
+            return True
+    return False
 
 # ====== EVENTS DETECTION ======
 EVENT_TYPE_KEYWORDS = {"event","block","blocked","calendar","personal","pto","vacation","meeting"}
@@ -290,17 +197,107 @@ def looks_like_event_job(job: dict) -> bool:
     if any(k in t2 for k in EVENT_TYPE_KEYWORDS): return True
     if any(k in title for k in EVENT_TYPE_KEYWORDS): return True
     if no_service_addr: return True
-    for _, name in NAME_MAP.items():
-        if name.lower() in title:
+    for emp_id in NAME_MAP.keys():
+        if title_mentions_emp(title, emp_id):
             return True
     return False
 
 def event_employee_id_from_title(title: str) -> Optional[str]:
-    low = (title or "").lower()
-    for emp_id, name in NAME_MAP.items():
-        if name.lower() in low:
+    for emp_id in NAME_MAP.keys():
+        if title_mentions_emp(title, emp_id):
             return emp_id
     return None
+
+# ====== PICK JOB INFO (time + employee) ======
+def pick_time_and_tech(job: dict) -> Tuple[Optional[datetime], Optional[datetime], Optional[str], str]:
+    start_utc = end_utc = None
+    employee_id = None
+
+    # standard schedule fields if present
+    schedule = job.get("schedule") or {}
+    s = schedule.get("scheduled_start") or job.get("scheduled_start") or job.get("start") or job.get("starts_at") or job.get("start_time")
+    e = schedule.get("scheduled_end")   or job.get("scheduled_end")   or job.get("end")   or job.get("ends_at")   or job.get("end_time")
+    if isinstance(s, str):
+        try: start_utc = parse_iso_utc(s)
+        except Exception: start_utc = None
+    if isinstance(e, str):
+        try: end_utc = parse_iso_utc(e)
+        except Exception: end_utc = None
+
+    # NEW: Public API commonly uses arrival_window_* / appointment_window_*
+    if not (start_utc and end_utc):
+        aw = job.get("arrival_window") or {}
+        aws = (
+            job.get("arrival_window_start")
+            or job.get("appointment_window_start")
+            or aw.get("start")
+            or aw.get("start_time")
+        )
+        awe = (
+            job.get("arrival_window_end")
+            or job.get("appointment_window_end")
+            or aw.get("end")
+            or aw.get("end_time")
+        )
+        if isinstance(aws, str) and isinstance(awe, str):
+            try:
+                start_utc = parse_iso_utc(aws)
+                end_utc   = parse_iso_utc(awe)
+            except Exception:
+                pass
+
+    # fallback: search any start/end-looking strings
+    if not (start_utc and end_utc):
+        for p, v in _walk(job):
+            low = p.lower()
+            if isinstance(v, str) and not start_utc and ("arrival_window_start" in low or ("start" in low and any(ch.isdigit() for ch in v))):
+                try: start_utc = parse_iso_utc(v)
+                except Exception: pass
+            if isinstance(v, str) and not end_utc and ("arrival_window_end" in low or ("end" in low and any(ch.isdigit() for ch in v))):
+                try: end_utc = parse_iso_utc(v)
+                except Exception: pass
+
+    # employee
+    assigned_employees = job.get("assigned_employees")
+    if isinstance(assigned_employees, list) and assigned_employees:
+        first = assigned_employees[0]
+        if isinstance(first, dict):
+            employee_id = first.get("id")
+
+    addr_str = address_to_str(job.get("address") or job.get("service_address") or {})
+
+    return start_utc, end_utc, employee_id, addr_str
+
+# ====== EVENTS PARSING ======
+def parse_event_time(ev: dict) -> Tuple[Optional[datetime], Optional[datetime]]:
+    # top-level common
+    for k_start, k_end in [
+        ("start", "end"),
+        ("scheduled_start", "scheduled_end"),
+        ("starts_at", "ends_at"),
+        ("start_time", "end_time"),
+    ]:
+        s = ev.get(k_start); e = ev.get(k_end)
+        if isinstance(s, str) and isinstance(e, str):
+            try: return parse_iso_utc(s), parse_iso_utc(e)
+            except Exception: pass
+    # IMPORTANT: Public API puts times under schedule.start_time / end_time
+    sch = ev.get("schedule") or {}
+    s = sch.get("start_time") or sch.get("scheduled_start") or sch.get("start")
+    e = sch.get("end_time")   or sch.get("scheduled_end")   or sch.get("end")
+    if isinstance(s, str) and isinstance(e, str):
+        try: return parse_iso_utc(s), parse_iso_utc(e)
+        except Exception: pass
+    return None, None
+
+def event_employee_id(ev: dict) -> Optional[str]:
+    ae = ev.get("assigned_employees")
+    if isinstance(ae, list) and ae:
+        first = ae[0]
+        if isinstance(first, dict) and first.get("id"):
+            return first["id"]
+    title = ev.get("title") or ev.get("name") or ev.get("summary") or ""
+    return event_employee_id_from_title(title)
 
 # ====== DEBUG ======
 @app.get("/health")
@@ -341,8 +338,7 @@ def debug_homes():
 
 @app.get("/debug/day")
 def debug_day(date: str = Query(..., description="YYYY-MM-DD")):
-    """Диагностика: какие окна (job/event) видим по техникам на дату."""
-    arrival_by_emp = collect_arrival_windows(days_ahead=30)
+    arrival_by_emp = collect_arrival_windows(days_ahead=60)
     try:
         target = datetime.fromisoformat(date).date()
     except Exception:
@@ -363,8 +359,7 @@ def debug_day(date: str = Query(..., description="YYYY-MM-DD")):
     return {"date": date, "seen": report}
 
 # ====== WINDOW TYPE ======
-# (win_start_local, win_end_local, address_str, is_event)
-Window = Tuple[datetime, datetime, str, bool]
+Window = Tuple[datetime, datetime, str, bool]  # (start_local, end_local, address/title, is_event)
 
 # ====== COLLECT ARRIVAL WINDOWS ======
 def try_collect_events_paged() -> List[dict]:
@@ -373,48 +368,12 @@ def try_collect_events_paged() -> List[dict]:
     except Exception:
         return []
 
-def parse_event_time(ev: dict) -> Tuple[Optional[datetime], Optional[datetime]]:
-    # 1) верхний уровень
-    for k_start, k_end in [
-        ("start", "end"),
-        ("scheduled_start", "scheduled_end"),
-        ("starts_at", "ends_at"),
-        ("start_time", "end_time"),
-    ]:
-        s = ev.get(k_start); e = ev.get(k_end)
-        if isinstance(s, str) and isinstance(e, str):
-            try:
-                return parse_iso_utc(s), parse_iso_utc(e)
-            except Exception:
-                pass
-    # 2) ВАЖНО: поддержка schedule.start_time/end_time (как в Public API)
-    sch = ev.get("schedule") or {}
-    s = sch.get("start_time") or sch.get("scheduled_start") or sch.get("start")
-    e = sch.get("end_time")   or sch.get("scheduled_end")   or sch.get("end")
-    if isinstance(s, str) and isinstance(e, str):
-        try:
-            return parse_iso_utc(s), parse_iso_utc(e)
-        except Exception:
-            pass
-    return None, None
-
-def event_employee_id(ev: dict) -> Optional[str]:
-    # 1) assigned_employees[0].id
-    ae = ev.get("assigned_employees")
-    if isinstance(ae, list) and ae:
-        first = ae[0]
-        if isinstance(first, dict) and first.get("id"):
-            return first["id"]
-    # 2) по заголовку
-    return event_employee_id_from_title(ev.get("title") or ev.get("name") or ev.get("summary") or "")
-
 def collect_arrival_windows(days_ahead: int) -> Dict[str, List[Window]]:
-    """ arrival_by_emp[employee_id] = [(ws,we,addr,is_event), ...] """
     now_local = datetime.now(APP_TZ)
     horizon_end = now_local + timedelta(days=max(1, days_ahead))
     arrival_by_emp: Dict[str, List[Window]] = {}
 
-    # Jobs (paged)
+    # Jobs
     jobs = hcp_paged_list("/jobs")
     for j in jobs if isinstance(jobs, list) else []:
         start_utc, end_utc, emp_id, addr_str = pick_time_and_tech(j)
@@ -425,10 +384,10 @@ def collect_arrival_windows(days_ahead: int) -> Dict[str, List[Window]]:
             continue
         is_event_job = looks_like_event_job(j)
         arrival_by_emp.setdefault(emp_id, []).append(
-            (ws, we, addr_str if not is_event_job else (j.get("title") or j.get("summary") or "Event"), is_event_job)
+            (ws, we, addr_str if not is_event_job else (j.get("title") or j.get("summary") or j.get("name") or "Event"), is_event_job)
         )
 
-    # Events (paged, now with schedule.* support)
+    # Events
     events = try_collect_events_paged()
     for ev in events:
         s_utc, e_utc = parse_event_time(ev)
@@ -474,49 +433,29 @@ def same_interval_exists(s: datetime, e: datetime, windows: List[Window]) -> boo
             return True
     return False
 
-# ====== NEW: hard caps for overlaps (v4.3.3) ======
-MAX_OVERLAP_PREV_MIN = 60   # ≤ 1 часа
-MAX_OVERLAP_NEXT_MIN = 60
-FULL_WINDOW_MIN = 180       # 3 часа — никогда
-
 def allowed_step_overlap(prev: Optional[Window],
                          nxt: Optional[Window],
                          new_s: datetime, new_e: datetime,
                          eta_prev_min: Optional[int]) -> bool:
-    """
-    Разрешены только «ступени», любые overlaps <= 60 минут.
-    Полное перекрытие (180 минут) запрещено. Events запрещают любой overlap.
-    """
-    # prev
+    # Events запрещают любой overlap; jobs допускают «ступени», но <=60 мин; 3 часа запрещено всегда.
     if prev:
         prev_s, prev_e, _, prev_is_event = prev
-        if prev_is_event:
-            if overlaps(new_s, new_e, prev_s, prev_e):
-                return False
-        else:
+        if prev_is_event and overlaps(new_s, new_e, prev_s, prev_e):
+            return False
+        if overlaps(new_s, new_e, prev_s, prev_e):
             cond_shifted = (new_s.hour == prev_s.hour + 1) and (eta_prev_min is not None and eta_prev_min <= VERY_CLOSE_THRESH)
             cond_base    = (new_s.hour == prev_s.hour + 2)
-            if overlaps(new_s, new_e, prev_s, prev_e):
-                if not (cond_shifted or cond_base):
-                    return False
-                ov = overlap_minutes(new_s, new_e, prev_s, prev_e)
-                if ov >= FULL_WINDOW_MIN or ov > MAX_OVERLAP_PREV_MIN:
-                    return False
-
-    # next
+            if not (cond_shifted or cond_base): return False
+            ov = overlap_minutes(new_s, new_e, prev_s, prev_e)
+            if ov >= FULL_WINDOW_MIN or ov > MAX_OVERLAP_PREV_MIN: return False
     if nxt:
         nxt_s, nxt_e, _, nxt_is_event = nxt
-        if nxt_is_event:
-            if overlaps(new_s, new_e, nxt_s, nxt_e):
-                return False
-        else:
-            if overlaps(new_s, new_e, nxt_s, nxt_e):
-                if nxt_s.hour != new_s.hour + 2:
-                    return False
-                ov = overlap_minutes(new_s, new_e, nxt_s, nxt_e)
-                if ov >= FULL_WINDOW_MIN or ov > MAX_OVERLAP_NEXT_MIN:
-                    return False
-
+        if nxt_is_event and overlaps(new_s, new_e, nxt_s, nxt_e):
+            return False
+        if overlaps(new_s, new_e, nxt_s, nxt_e):
+            if nxt_s.hour != new_s.hour + 2: return False
+            ov = overlap_minutes(new_s, new_e, nxt_s, nxt_e)
+            if ov >= FULL_WINDOW_MIN or ov > MAX_OVERLAP_NEXT_MIN: return False
     return True
 
 # ====== BUILD CANDIDATES ======
@@ -569,13 +508,12 @@ def build_candidates_for_day(
             s, e = grid_slot(dt_day, h)
             if not within_client_window(s, e, day_start, day_end, win_start_str, win_end_str):
                 continue
-
             if h in occupied_hours:
                 continue
             if same_interval_exists(s, e, todays_windows):
                 continue
 
-            # Первый визит дня не может перекрывать НИ одно окно (job/event)
+            # первый визит дня не может перекрывать НИ одно окно
             if prev is None and overlapping_windows(s, e, todays_windows):
                 continue
 
@@ -644,9 +582,9 @@ def suggest(body: SuggestIn):
                 todays = sorted(buckets.get(day_key, []), key=lambda t: t[0])
 
                 dow = day_dt.weekday()  # Mon=0 .. Sun=6
-                if dow == 6:  # Sunday
+                if dow == 6:  # Sunday — выходной для всех
                     continue
-                if dow == 5 and emp_id != ALEX_ID:  # Saturday only Alex
+                if dow == 5 and emp_id != ALEX_ID:  # Saturday — только Alex
                     continue
 
                 if body.preferred_days and weekday_code(day_dt) not in set(body.preferred_days):
