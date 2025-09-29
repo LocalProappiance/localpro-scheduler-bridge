@@ -183,17 +183,39 @@ def pick_time_and_tech(job: dict) -> Tuple[Optional[datetime], Optional[datetime
 
     addr_str = address_to_str(job.get("address") or job.get("service_address") or {})
 
-    if not start_utc or not end_utc:
-        for p, v in _walk(job):
-            low = p.lower()
-            if isinstance(v, str) and not start_utc and ("start" in low or "begin" in low) and any(ch.isdigit() for ch in v):
-                try: start_utc = parse_iso_utc(v)
-                except Exception: pass
-            if isinstance(v, str) and not end_utc and ("end" in low or "finish" in low) and any(ch.isdigit() for ch in v):
-                try: end_utc = parse_iso_utc(v)
-                except Exception: pass
+# --- HCP Public API: arrival window полями job ---
+if not (start_utc and end_utc):
+    aws = (
+        job.get("arrival_window_start") or
+        job.get("appointment_window_start") or
+        (job.get("arrival_window") or {}).get("start") or
+        (job.get("arrival_window") or {}).get("start_time")
+    )
+    awe = (
+        job.get("arrival_window_end") or
+        job.get("appointment_window_end") or
+        (job.get("arrival_window") or {}).get("end") or
+        (job.get("arrival_window") or {}).get("end_time")
+    )
+    if isinstance(aws, str) and isinstance(awe, str):
+        try:
+            start_utc = parse_iso_utc(aws)
+            end_utc   = parse_iso_utc(awe)
+        except Exception:
+            pass
 
-    return start_utc, end_utc, employee_id, addr_str
+# универсальный обход — оставь как у тебя
+if not (start_utc and end_utc):
+    for p, v in _walk(job):
+        low = p.lower()
+        if isinstance(v, str) and not start_utc and ("arrival_window_start" in low or ("start" in low and any(ch.isdigit() for ch in v))):
+            try: start_utc = parse_iso_utc(v)
+            except Exception: pass
+        if isinstance(v, str) and not end_utc and ("arrival_window_end" in low or ("end" in low and any(ch.isdigit() for ch in v))):
+            try: end_utc = parse_iso_utc(v)
+            except Exception: pass
+
+return start_utc, end_utc, employee_id, addr_str
 
 # ====== ETA ======
 def google_eta_minutes(src_addr: str, dst_addr: str) -> Optional[int]:
