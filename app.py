@@ -1,3 +1,5 @@
+# app.py
+# LocalPRO Scheduler Bridge (v4.3.3 + fix: parse schedule.start_time/end_time for /events)
 import os
 from datetime import datetime, timedelta, time
 from typing import Any, Optional, List, Tuple, Dict
@@ -45,7 +47,7 @@ GRID_STARTS = [9, 10, 11, 12, 13, 14, 15]  # 3-часовые окна: 9–12..
 ALEX_ID = "pro_5d48854aad6542a28f9da12d0c1b65f2"  # Суббота — только Alex
 
 # ====== APP ======
-app = FastAPI(title="LocalPRO Scheduler Bridge (v4.3.3)")
+app = FastAPI(title="LocalPRO Scheduler Bridge (v4.3.3+events-schedule-fix)")
 
 # ====== MODELS ======
 class SuggestIn(BaseModel):
@@ -225,8 +227,10 @@ def estimate_eta_heuristic(src_addr: str, dst_addr: str) -> int:
             for i in range(len(parts)-1):
                 if len(parts[i+1]) == 2 and parts[i+1].isalpha():
                     return parts[i].lower()
+            if len(parts) >= 3:
+                return parts[-3].lower()
             if len(parts) >= 2:
-                return parts[-3].lower() if len(parts) >= 3 else parts[1].lower()
+                return parts[1].lower()
             return a.lower()
         except Exception:
             return a.lower()
@@ -348,6 +352,7 @@ def try_collect_events_paged() -> List[dict]:
         return []
 
 def parse_event_time(ev: dict) -> Tuple[Optional[datetime], Optional[datetime]]:
+    # 1) верхний уровень
     for k_start, k_end in [
         ("start", "end"),
         ("scheduled_start", "scheduled_end"),
@@ -356,21 +361,30 @@ def parse_event_time(ev: dict) -> Tuple[Optional[datetime], Optional[datetime]]:
     ]:
         s = ev.get(k_start); e = ev.get(k_end)
         if isinstance(s, str) and isinstance(e, str):
-            try: return parse_iso_utc(s), parse_iso_utc(e)
-            except Exception: pass
+            try:
+                return parse_iso_utc(s), parse_iso_utc(e)
+            except Exception:
+                pass
+    # 2) ВАЖНО: поддержка schedule.start_time/end_time (как в Public API)
     sch = ev.get("schedule") or {}
-    s = sch.get("scheduled_start"); e = sch.get("scheduled_end")
+    s = sch.get("start_time") or sch.get("scheduled_start") or sch.get("start")
+    e = sch.get("end_time")   or sch.get("scheduled_end")   or sch.get("end")
     if isinstance(s, str) and isinstance(e, str):
-        try: return parse_iso_utc(s), parse_iso_utc(e)
-        except Exception: pass
+        try:
+            return parse_iso_utc(s), parse_iso_utc(e)
+        except Exception:
+            pass
     return None, None
 
 def event_employee_id(ev: dict) -> Optional[str]:
+    # 1) assigned_employees[0].id
     ae = ev.get("assigned_employees")
     if isinstance(ae, list) and ae:
-        if isinstance(ae[0], dict) and ae[0].get("id"):
-            return ae[0]["id"]
-    return event_employee_id_from_title(ev.get("title") or ev.get("summary") or ev.get("name") or "")
+        first = ae[0]
+        if isinstance(first, dict) and first.get("id"):
+            return first["id"]
+    # 2) по заголовку
+    return event_employee_id_from_title(ev.get("title") or ev.get("name") or ev.get("summary") or "")
 
 def collect_arrival_windows(days_ahead: int) -> Dict[str, List[Window]]:
     """ arrival_by_emp[employee_id] = [(ws,we,addr,is_event), ...] """
@@ -392,7 +406,7 @@ def collect_arrival_windows(days_ahead: int) -> Dict[str, List[Window]]:
             (ws, we, addr_str if not is_event_job else (j.get("title") or j.get("summary") or "Event"), is_event_job)
         )
 
-    # Events (paged)
+    # Events (paged, now with schedule.* support)
     events = try_collect_events_paged()
     for ev in events:
         s_utc, e_utc = parse_event_time(ev)
@@ -402,7 +416,7 @@ def collect_arrival_windows(days_ahead: int) -> Dict[str, List[Window]]:
         ws = to_local(s_utc); we = to_local(e_utc)
         if we < now_local or ws > horizon_end:
             continue
-        addr_str = address_to_str(ev.get("address") or {}) or (ev.get("title") or ev.get("summary") or "Event")
+        addr_str = address_to_str(ev.get("address") or {}) or (ev.get("title") or ev.get("summary") or ev.get("name") or "Event")
         arrival_by_emp.setdefault(emp_id, []).append((ws, we, addr_str, True))
 
     for emp_id in arrival_by_emp:
@@ -439,18 +453,17 @@ def same_interval_exists(s: datetime, e: datetime, windows: List[Window]) -> boo
     return False
 
 # ====== NEW: hard caps for overlaps (v4.3.3) ======
-MAX_OVERLAP_PREV_MIN = 60   # раньше было 120 — теперь не более 1 часа
-MAX_OVERLAP_NEXT_MIN = 60   # было 60 — оставляем 60
-FULL_WINDOW_MIN = 180       # 3 часа — категорически нельзя
+MAX_OVERLAP_PREV_MIN = 60   # ≤ 1 часа
+MAX_OVERLAP_NEXT_MIN = 60
+FULL_WINDOW_MIN = 180       # 3 часа — никогда
 
 def allowed_step_overlap(prev: Optional[Window],
                          nxt: Optional[Window],
                          new_s: datetime, new_e: datetime,
                          eta_prev_min: Optional[int]) -> bool:
     """
-    Разрешены только «ступени», причём любые overlaps ограничены ≤ 60 минут.
-    Полное перекрытие (180 минут) запрещено всегда.
-    Event-блокаторы запрещают любой overlap.
+    Разрешены только «ступени», любые overlaps <= 60 минут.
+    Полное перекрытие (180 минут) запрещено. Events запрещают любой overlap.
     """
     # prev
     if prev:
@@ -465,9 +478,7 @@ def allowed_step_overlap(prev: Optional[Window],
                 if not (cond_shifted or cond_base):
                     return False
                 ov = overlap_minutes(new_s, new_e, prev_s, prev_e)
-                if ov >= FULL_WINDOW_MIN:
-                    return False
-                if ov > MAX_OVERLAP_PREV_MIN:
+                if ov >= FULL_WINDOW_MIN or ov > MAX_OVERLAP_PREV_MIN:
                     return False
 
     # next
@@ -481,9 +492,7 @@ def allowed_step_overlap(prev: Optional[Window],
                 if nxt_s.hour != new_s.hour + 2:
                     return False
                 ov = overlap_minutes(new_s, new_e, nxt_s, nxt_e)
-                if ov >= FULL_WINDOW_MIN:
-                    return False
-                if ov > MAX_OVERLAP_NEXT_MIN:
+                if ov >= FULL_WINDOW_MIN or ov > MAX_OVERLAP_NEXT_MIN:
                     return False
 
     return True
@@ -544,7 +553,7 @@ def build_candidates_for_day(
             if same_interval_exists(s, e, todays_windows):
                 continue
 
-            # Первый визит дня (prev=None) не может перекрывать НИ одно окно (job/event)
+            # Первый визит дня не может перекрывать НИ одно окно (job/event)
             if prev is None and overlapping_windows(s, e, todays_windows):
                 continue
 
