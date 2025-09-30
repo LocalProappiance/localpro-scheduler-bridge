@@ -1,9 +1,11 @@
 # app.py
 # LocalPRO Scheduler Bridge
-# v4.3.3 + fixes:
-# - /events: support schedule.start_time/end_time
-# - /jobs: support arrival_window_* & appointment_window_* fields
-# - stricter overlap rules: events are hard blocks; jobs step overlaps <= 60 min
+# v4.3.5
+# Изменения:
+# - /events: поддержка schedule.start_time/end_time; fallback по title/name/summary
+# - /jobs: поддержка arrival_window_* / appointment_window_* / arrival_window.{start,end,start_time,end_time}
+# - Инференс техника для jobs, если отсутствует assigned_employees (employee_id/pro_id/... или по заголовку)
+# - Events = жёсткие блоки; jobs допускают "ступени" с overlap <= 60 мин; полное перекрытие (3ч) запрещено
 
 import os
 from datetime import datetime, timedelta, time
@@ -60,7 +62,7 @@ MAX_OVERLAP_NEXT_MIN = 60
 FULL_WINDOW_MIN      = 180  # 3 часа — категорически нельзя
 
 # ====== APP ======
-app = FastAPI(title="LocalPRO Scheduler Bridge (v4.3.3+events+arrival-window)")
+app = FastAPI(title="LocalPRO Scheduler Bridge (v4.3.5)")
 
 # ====== MODELS ======
 class SuggestIn(BaseModel):
@@ -129,7 +131,7 @@ def address_to_str(addr):
 def parse_iso_utc(s: str) -> datetime:
     if not isinstance(s, str):
         raise ValueError("Not a string")
-    # HCP возвращает ISO и с "Z", и без TZ. Считаем без TZ как UTC (HCP events дают Z).
+    # HCP возвращает ISO и с "Z", и без TZ. Считаем без TZ как UTC (events дают Z).
     if s.endswith("Z"):
         s = s.replace("Z", "+00:00")
     dt = datetime.fromisoformat(s)
@@ -208,10 +210,31 @@ def event_employee_id_from_title(title: str) -> Optional[str]:
             return emp_id
     return None
 
-# ====== PICK JOB INFO (time + employee) ======
+# ====== JOB: time+employee ======
+def infer_job_employee_id(job: dict) -> Optional[str]:
+    # 1) стандартный массив
+    ae = job.get("assigned_employees")
+    if isinstance(ae, list) and ae:
+        first = ae[0]
+        if isinstance(first, dict) and first.get("id"):
+            return first["id"]
+    # 2) популярные альтернативы
+    for key in ["employee_id", "pro_id", "technician_id", "assigned_to_id"]:
+        v = job.get(key)
+        if isinstance(v, str) and v.startswith("pro_"):
+            return v
+    cand = job.get("employee") or job.get("technician") or job.get("assigned_to") or job.get("assigned_employee")
+    if isinstance(cand, dict):
+        for k in ["id", "employee_id", "pro_id", "technician_id"]:
+            v = cand.get(k)
+            if isinstance(v, str) and v.startswith("pro_"):
+                return v
+    # 3) «dispatch by name»
+    title = job.get("title") or job.get("summary") or job.get("name") or ""
+    return event_employee_id_from_title(title)
+
 def pick_time_and_tech(job: dict) -> Tuple[Optional[datetime], Optional[datetime], Optional[str], str]:
     start_utc = end_utc = None
-    employee_id = None
 
     # standard schedule fields if present
     schedule = job.get("schedule") or {}
@@ -224,7 +247,7 @@ def pick_time_and_tech(job: dict) -> Tuple[Optional[datetime], Optional[datetime
         try: end_utc = parse_iso_utc(e)
         except Exception: end_utc = None
 
-    # NEW: Public API commonly uses arrival_window_* / appointment_window_*
+    # Public API: arrival window / appointment window
     if not (start_utc and end_utc):
         aw = job.get("arrival_window") or {}
         aws = (
@@ -246,7 +269,7 @@ def pick_time_and_tech(job: dict) -> Tuple[Optional[datetime], Optional[datetime
             except Exception:
                 pass
 
-    # fallback: search any start/end-looking strings
+    # fallback: ищем любые start/end-подобные строки
     if not (start_utc and end_utc):
         for p, v in _walk(job):
             low = p.lower()
@@ -257,13 +280,7 @@ def pick_time_and_tech(job: dict) -> Tuple[Optional[datetime], Optional[datetime
                 try: end_utc = parse_iso_utc(v)
                 except Exception: pass
 
-    # employee
-    assigned_employees = job.get("assigned_employees")
-    if isinstance(assigned_employees, list) and assigned_employees:
-        first = assigned_employees[0]
-        if isinstance(first, dict):
-            employee_id = first.get("id")
-
+    employee_id = infer_job_employee_id(job)
     addr_str = address_to_str(job.get("address") or job.get("service_address") or {})
 
     return start_utc, end_utc, employee_id, addr_str
@@ -281,7 +298,7 @@ def parse_event_time(ev: dict) -> Tuple[Optional[datetime], Optional[datetime]]:
         if isinstance(s, str) and isinstance(e, str):
             try: return parse_iso_utc(s), parse_iso_utc(e)
             except Exception: pass
-    # IMPORTANT: Public API puts times under schedule.start_time / end_time
+    # schedule.*
     sch = ev.get("schedule") or {}
     s = sch.get("start_time") or sch.get("scheduled_start") or sch.get("start")
     e = sch.get("end_time")   or sch.get("scheduled_end")   or sch.get("end")
@@ -437,7 +454,7 @@ def allowed_step_overlap(prev: Optional[Window],
                          nxt: Optional[Window],
                          new_s: datetime, new_e: datetime,
                          eta_prev_min: Optional[int]) -> bool:
-    # Events запрещают любой overlap; jobs допускают «ступени», но <=60 мин; 3 часа запрещено всегда.
+    # Events запрещают любой overlap; jobs допускают «ступени», но <= 60 мин; 3ч — никогда.
     if prev:
         prev_s, prev_e, _, prev_is_event = prev
         if prev_is_event and overlaps(new_s, new_e, prev_s, prev_e):
@@ -556,6 +573,68 @@ def build_candidates_for_day(
             })
 
     return results
+
+# ====== ETA ======
+def google_eta_minutes(src_addr: str, dst_addr: str) -> Optional[int]:
+    if not GMAPS_KEY:
+        return None
+    try:
+        resp = requests.get(
+            "https://maps.googleapis.com/maps/api/distancematrix/json",
+            params={"origins": src_addr, "destinations": dst_addr, "key": GMAPS_KEY, "units": "imperial"},
+            timeout=15
+        )
+        data = resp.json()
+        if data.get("status") != "OK":
+            return None
+        rows = data.get("rows", [])
+        if not rows or not rows[0].get("elements"):
+            return None
+        el = rows[0]["elements"][0]
+        if el.get("status") != "OK":
+            return None
+        seconds = el["duration"]["value"]
+        return int(round(seconds / 60))
+    except Exception:
+        return None
+
+NEAR_CITIES = {"st. augustine", "st augustine", "jacksonville", "orange park"}
+def estimate_eta_heuristic(src_addr: str, dst_addr: str) -> int:
+    def city(a: str) -> str:
+        try:
+            parts = [p.strip() for p in a.split(",")]
+            for i in range(len(parts)-1):
+                if len(parts[i+1]) == 2 and parts[i+1].isalpha():
+                    return parts[i].lower()
+            if len(parts) >= 3:
+                return parts[-3].lower()
+            if len(parts) >= 2:
+                return parts[1].lower()
+            return a.lower()
+        except Exception:
+            return a.lower()
+    a = city(src_addr or "")
+    b = city(dst_addr or "")
+    if not a or not b:
+        return 30
+    if a == b:
+        return 12
+    if a in NEAR_CITIES and b in NEAR_CITIES:
+        return 22
+    return 45
+
+def eta_minutes(src_addr: str, dst_addr: str) -> int:
+    if not src_addr or not dst_addr:
+        return 30
+    real = google_eta_minutes(src_addr, dst_addr)
+    return real if real is not None else estimate_eta_heuristic(src_addr, dst_addr)
+
+def risk_label(eta: int) -> str:
+    if eta <= VERY_CLOSE_THRESH:
+        return "low"
+    if eta <= NORMAL_THRESH:
+        return "medium"
+    return "high"
 
 # ====== MAIN JSON ======
 @app.post("/suggest", response_model=SuggestOut)
